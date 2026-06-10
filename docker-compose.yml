@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    env_file: .env
+    expose:
+      - "8765"
+    restart: unless-stopped
+    networks:
+      - tunnel-net
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8766:8766"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - tunnel-net
+
+networks:
+  tunnel-net:
+    external: true
