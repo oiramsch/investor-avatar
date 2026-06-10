@@ -6,7 +6,7 @@ services:
       - "8765"
     restart: unless-stopped
     networks:
-      - tunnel-net
+      - ki-fabrik
 
   frontend:
     build: ./frontend
@@ -16,8 +16,8 @@ services:
       - backend
     restart: unless-stopped
     networks:
-      - tunnel-net
+      - ki-fabrik
 
 networks:
-  tunnel-net:
+  ki-fabrik:
     external: true

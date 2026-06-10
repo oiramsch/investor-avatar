@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import AvatarPlayer from './components/AvatarPlayer'
 import ChatPanel from './components/ChatPanel'
 
@@ -8,6 +8,7 @@ export default function App() {
   const [streamInfo, setStreamInfo] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
   const [rsvpDone, setRsvpDone] = useState(false)
+  const initSentRef = useRef(false)
 
   const notionId = new URLSearchParams(window.location.search).get('id')
 
@@ -67,11 +68,13 @@ export default function App() {
     [messages, notionId, streamInfo],
   )
 
-  // Send greeting on first load
+  // Send greeting once WebRTC connection is established (or falls back to disabled mode)
   useEffect(() => {
-    sendMessage('__INIT__', [])
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    if (streamInfo !== null && !initSentRef.current) {
+      initSentRef.current = true
+      sendMessage('__INIT__', [])
+    }
+  }, [streamInfo, sendMessage])
 
   const handleStreamReady = useCallback((info) => {
     setStreamInfo(info)

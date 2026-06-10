@@ -1,5 +1,15 @@
 import { useState, useRef, useEffect } from 'react'
 
+function stripMarkdown(text) {
+  return text
+    .replace(/\*\*(.+?)\*\*/gs, '$1')
+    .replace(/\*(.+?)\*/gs, '$1')
+    .replace(/__(.+?)__/gs, '$1')
+    .replace(/_(.+?)_/gs, '$1')
+    .replace(/`(.+?)`/gs, '$1')
+    .replace(/^#+\s+/gm, '')
+}
+
 function Message({ role, content }) {
   const isUser = role === 'user'
   return (
@@ -16,7 +26,7 @@ function Message({ role, content }) {
             : 'bg-gray-800 text-gray-100 rounded-bl-sm'
         }`}
       >
-        {content}
+        {stripMarkdown(content)}
       </div>
     </div>
   )

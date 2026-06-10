@@ -1,7 +1,11 @@
 import os
+import re
 import base64
+import logging
 import httpx
 from fastapi import FastAPI, HTTPException
+
+logger = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Any
@@ -36,6 +40,16 @@ VOICE_MAP = {
 }
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def strip_markdown(text: str) -> str:
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'_(.+?)_', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'`(.+?)`', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    return text.strip()
 
 
 def did_headers() -> dict:
@@ -121,6 +135,7 @@ Du bist herzlich, enthusiastisch und persönlich. Halte Antworten kurz (2-4 Sät
 
 WICHTIG: Sprich den Gast IMMER mit "Du" und beim Vornamen "{vorname}" an.
 Antworte NUR auf {lang_display}.
+Antworte in reinem Fließtext – verwende kein Markdown (keine Sternchen, kein Fettdruck, keine Aufzählungszeichen).
 
 GAST:
 - Vorname: {vorname}"""
@@ -373,15 +388,16 @@ async def chat(req: ChatRequest):
     # Trigger D-ID avatar to speak the reply
     if req.stream_id and req.session_id and reply_text and DID_API_KEY:
         voice = VOICE_MAP.get(guest.get("sprache", "Deutsch"), VOICE_MAP["Deutsch"])
+        speech_text = strip_markdown(reply_text)
         try:
             async with httpx.AsyncClient() as http_client:
-                await http_client.post(
+                did_resp = await http_client.post(
                     f"{DID_BASE_URL}/talks/streams/{req.stream_id}/talks",
                     headers=did_headers(),
                     json={
                         "script": {
                             "type": "text",
-                            "input": reply_text,
+                            "input": speech_text,
                             "provider": voice,
                         },
                         "config": {"stitch": True},
@@ -389,8 +405,10 @@ async def chat(req: ChatRequest):
                     },
                     timeout=30,
                 )
-        except Exception:
-            pass  # Don't break chat if D-ID talk fails
+            if did_resp.status_code not in (200, 201):
+                logger.error("D-ID /talks error %s: %s", did_resp.status_code, did_resp.text)
+        except Exception as exc:
+            logger.error("D-ID /talks request failed: %s", exc)
 
     return {"reply": reply_text, "rsvp_updated": rsvp_updated, "rsvp": rsvp_result}
 
