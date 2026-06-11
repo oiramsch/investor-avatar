@@ -5,55 +5,82 @@ import ChatPanel from './components/ChatPanel'
 export default function App() {
   const [guest, setGuest] = useState(null)
   const [messages, setMessages] = useState([])
-  const [streamInfo, setStreamInfo] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
   const [rsvpDone, setRsvpDone] = useState(false)
-  const initSentRef = useRef(false)
+  const avatarApiRef = useRef(null)
 
   const notionId = new URLSearchParams(window.location.search).get('id')
 
   useEffect(() => {
-    if (notionId) {
-      fetch(`/api/guest/${notionId}`)
-        .then((r) => r.json())
-        .then((data) => {
-          setGuest(data)
-          if (data.zusage && data.zusage !== '') setRsvpDone(true)
-        })
-        .catch(console.error)
-    }
+    if (!notionId) return
+    fetch(`/api/guest/${notionId}`)
+      .then((r) => r.json())
+      .then((data) => {
+        setGuest(data)
+        if (data.zusage && data.zusage !== '') setRsvpDone(true)
+      })
+      .catch(console.error)
   }, [notionId])
 
-  const sendMessage = useCallback(
-    async (text, currentHistory) => {
-      const isInit = text === '__INIT__'
-      const history = currentHistory ?? messages
+  // Avatar exposes either `{guest}` (one-time on session ready) or
+  // `{sendText}` (each render once the manager is up). We merge both, and
+  // accept `null` so the chat falls back to /api/chat cleanly when the
+  // avatar's SDK handle goes away (teardown/error/unmount).
+  const handleAvatarReady = useCallback((api) => {
+    if (api === null) {
+      avatarApiRef.current = null
+      return
+    }
+    if (api?.sendText) {
+      avatarApiRef.current = api
+    }
+    // Use the backend-provided guest preview as a fallback when /api/guest
+    // didn't return one (e.g. no `id` query param, or that lookup failed).
+    if (api?.guest) {
+      setGuest((prev) => prev ?? api.guest)
+    }
+  }, [])
 
-      if (!isInit) {
-        setMessages((prev) => [...prev, { role: 'user', content: text }])
-      }
+  const handleAvatarMessage = useCallback((msg) => {
+    setMessages((prev) => {
+      // The SDK callbacks fire for each final turn; dedupe by string equality
+      // with the most recent same-role entry to avoid double-appending.
+      const last = prev[prev.length - 1]
+      if (last && last.role === msg.role && last.content === msg.content) return prev
+      return [...prev, msg]
+    })
+  }, [])
+
+  // Text-chat fallback / parallel: if the SDK manager is up, route the message
+  // through it so the avatar speaks the reply. Otherwise fall back to the
+  // legacy /api/chat endpoint.
+  const sendText = useCallback(
+    async (text) => {
+      const trimmed = text.trim()
+      if (!trimmed) return
+      setMessages((prev) => [...prev, { role: 'user', content: trimmed }])
       setIsLoading(true)
-
       try {
-        const r = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: text,
-            notion_id: notionId,
-            stream_id: streamInfo?.streamId ?? null,
-            session_id: streamInfo?.sessionId ?? null,
-            history: isInit ? [] : history,
-          }),
-        })
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        const data = await r.json()
-
-        setMessages((prev) => [...prev, { role: 'assistant', content: data.reply }])
-
-        if (data.rsvp_updated && data.rsvp) {
-          setRsvpDone(true)
-          setGuest((prev) => (prev ? { ...prev, zusage: data.rsvp.zusage } : prev))
+        if (avatarApiRef.current?.sendText) {
+          await avatarApiRef.current.sendText(trimmed)
+          // The avatar's onNewMessage will append the assistant reply.
+        } else {
+          const r = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: trimmed,
+              notion_id: notionId,
+              history: messages,
+            }),
+          })
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          const data = await r.json()
+          setMessages((prev) => [...prev, { role: 'assistant', content: data.reply }])
+          if (data.rsvp_updated && data.rsvp) {
+            setRsvpDone(true)
+            setGuest((prev) => (prev ? { ...prev, zusage: data.rsvp.zusage } : prev))
+          }
         }
       } catch (err) {
         console.error('Chat error:', err)
@@ -65,20 +92,8 @@ export default function App() {
         setIsLoading(false)
       }
     },
-    [messages, notionId, streamInfo],
+    [messages, notionId],
   )
-
-  // Send greeting once WebRTC connection is established (or falls back to disabled mode)
-  useEffect(() => {
-    if (streamInfo !== null && !initSentRef.current) {
-      initSentRef.current = true
-      sendMessage('__INIT__', [])
-    }
-  }, [streamInfo, sendMessage])
-
-  const handleStreamReady = useCallback((info) => {
-    setStreamInfo(info)
-  }, [])
 
   const displayName = guest?.vorname || guest?.name || null
 
@@ -119,7 +134,11 @@ export default function App() {
       <main className="flex-1 flex flex-col lg:flex-row gap-0 lg:gap-6 p-4 lg:p-6 max-w-6xl mx-auto w-full">
         {/* Avatar column */}
         <div className="lg:w-2/5 flex flex-col items-center">
-          <AvatarPlayer onStreamReady={handleStreamReady} />
+          <AvatarPlayer
+            notionId={notionId}
+            onReady={handleAvatarReady}
+            onMessage={handleAvatarMessage}
+          />
           <div className="mt-3 text-center">
             <div className="text-xs text-gray-500">ARIA · Digitale Gastgeberin</div>
             <div className="text-xs text-gray-600 mt-0.5">Sandhauser Str. 20, 13505 Berlin</div>
@@ -130,7 +149,7 @@ export default function App() {
         <div className="lg:w-3/5 flex flex-col mt-4 lg:mt-0 min-h-0">
           <ChatPanel
             messages={messages}
-            onSend={(text) => sendMessage(text, messages)}
+            onSend={sendText}
             isLoading={isLoading}
             rsvpDone={rsvpDone}
           />
