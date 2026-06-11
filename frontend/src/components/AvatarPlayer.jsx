@@ -32,11 +32,24 @@ export default function AvatarPlayer({ onStreamReady }) {
           }
         }
 
+        let streamReadyFired = false
         pc.onconnectionstatechange = () => {
           if (cancelled) return
           const state = pc.connectionState
-          if (state === 'connected') setStatus('idle')
-          if (state === 'failed' || state === 'disconnected') setStatus('error')
+          if (state === 'connected') {
+            setStatus('idle')
+            if (!streamReadyFired) {
+              streamReadyFired = true
+              onStreamReady?.({ streamId, sessionId })
+            }
+          }
+          if (state === 'failed' || state === 'disconnected') {
+            setStatus('error')
+            if (!streamReadyFired) {
+              streamReadyFired = true
+              onStreamReady?.({ streamId: null, sessionId: null })
+            }
+          }
         }
 
         pc.onicecandidate = async ({ candidate }) => {
@@ -71,9 +84,6 @@ export default function AvatarPlayer({ onStreamReady }) {
           }),
         })
 
-        if (!cancelled) {
-          onStreamReady?.({ streamId, sessionId })
-        }
       } catch (err) {
         if (!cancelled) {
           console.warn('D-ID WebRTC setup failed:', err)
