@@ -1,26 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import * as didSdk from '@d-id/client-sdk'
 
-/**
- * Realtime D-ID Agent player.
- *
- * Lifecycle:
- *   1. Mount → fetch `/api/agent-session?notion_id=X` for {agent_id, client_key,
- *      claim_marker}. We don't connect yet — iOS requires a user gesture before
- *      mic/audio can start.
- *   2. User taps "Gespräch starten" → request mic, init `createAgentManager`
- *      with externalId=claim_token, connect, publish mic, and send the CLAIM
- *      handshake message so the backend can bind this session to the guest.
- *   3. Status badge and onNewMessage relay live transcript + assistant text
- *      back to the parent via `onMessage`.
- *
- * The CLAIM handshake message is filtered out via `parent.filterMessage`
- * before display.
- */
+const MAX_DEBUG_ERRORS = 5
+
 export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const videoRef = useRef(null)
   const managerRef = useRef(null)
   const micStreamRef = useRef(null)
+  const srcObjectRef = useRef(null)
   const cancelledRef = useRef(false)
   const claimSentRef = useRef(false)
 
@@ -29,11 +16,49 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const [errorMsg, setErrorMsg] = useState('')
   const [muted, setMuted] = useState(true)
   const [micActive, setMicActive] = useState(false)
+  const [micError, setMicError] = useState('')
+
+  const isDebug = new URLSearchParams(window.location.search).get('debug') === '1'
+  const [debug, setDebug] = useState({
+    connState: '—',
+    lastEvent: '—',
+    videoReadyState: -1,
+    videoWidth: 0,
+    videoHeight: 0,
+    videoTracks: 0,
+    audioTracks: 0,
+    micPermission: '?',
+    micPublish: '—',
+    claimSent: false,
+    claimTs: '',
+    claimResult: '—',
+    errors: [],
+  })
+
+  const pushDebugError = useCallback((msg) => {
+    setDebug((prev) => ({
+      ...prev,
+      errors: [...prev.errors.slice(-(MAX_DEBUG_ERRORS - 1)), msg],
+    }))
+  }, [])
+
+  const updateVideoDebug = useCallback(() => {
+    const v = videoRef.current
+    if (!v) return
+    const so = v.srcObject
+    setDebug((prev) => ({
+      ...prev,
+      videoReadyState: v.readyState,
+      videoWidth: v.videoWidth,
+      videoHeight: v.videoHeight,
+      videoTracks: so ? so.getVideoTracks().length : 0,
+      audioTracks: so ? so.getAudioTracks().length : 0,
+    }))
+  }, [])
 
   // 1) Fetch session config from backend on mount
   useEffect(() => {
     cancelledRef.current = false
-    // New session config → fresh handshake must fire again.
     claimSentRef.current = false
     fetch('/api/agent-session', {
       method: 'POST',
@@ -53,7 +78,6 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         console.warn('agent-session unavailable:', err)
         if (cancelledRef.current) return
         setStatus('disabled')
-        // Still signal "ready" so the parent's text-chat fallback can render.
         onReady?.({ guest: null })
       })
 
@@ -76,21 +100,41 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     }
   }, [])
 
-  // 2) User-initiated connect (gesture is required for iOS audio + mic)
+  // 2) User-initiated connect (gesture required for iOS audio + mic)
   const handleStart = async () => {
     if (!sessionConfig || status === 'connecting' || status === 'live') return
     setStatus('requesting')
     setErrorMsg('')
+    setMicError('')
+
+    if (isDebug) {
+      try {
+        const perm = await navigator.permissions.query({ name: 'microphone' })
+        setDebug((prev) => ({ ...prev, micPermission: perm.state }))
+      } catch {
+        setDebug((prev) => ({ ...prev, micPermission: 'api-unavailable' }))
+      }
+    }
 
     let micStream
     try {
       micStream = await navigator.mediaDevices.getUserMedia({ audio: true })
       micStreamRef.current = micStream
       setMicActive(true)
+      if (isDebug) setDebug((prev) => ({ ...prev, micPermission: 'granted' }))
     } catch (err) {
+      const label = `${err.name}: ${err.message}`
       console.warn('getUserMedia denied:', err)
-      // Mic denial is non-fatal — user can still text-chat or just listen.
       setMicActive(false)
+      setMicError(label)
+      if (isDebug) {
+        setDebug((prev) => ({
+          ...prev,
+          micPermission: err.name,
+          micPublish: `getUserMedia failed: ${label}`,
+        }))
+        pushDebugError(`getUserMedia: ${label}`)
+      }
     }
 
     setStatus('connecting')
@@ -98,9 +142,6 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     try {
       const manager = await didSdk.createAgentManager(sessionConfig.agent_id, {
         auth: { type: 'key', clientKey: sessionConfig.client_key },
-        // externalId likely surfaces as X-DID-DISTINCT-ID on the Custom-LLM
-        // request — the backend uses it as a session→guest lookup key. The
-        // CLAIM message below is the belt-and-braces fallback if it doesn't.
         externalId: sessionConfig.claim_token,
         streamOptions: {
           compatibilityMode: 'auto',
@@ -108,41 +149,65 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         },
         callbacks: {
           onSrcObjectReady(srcObject) {
+            srcObjectRef.current = srcObject
             const v = videoRef.current
             if (!v) return
+            // Start with the live WebRTC stream; onVideoStateChange will switch to
+            // idle_video once the warmup/talking stream stops.
+            v.src = ''
             v.srcObject = srcObject
-            v.play().catch((err) => {
-              console.warn('video.play() failed:', err)
-            })
+            v.play().catch((e) => console.warn('video.play() failed:', e))
+            if (isDebug) updateVideoDebug()
           },
+
+          onVideoStateChange(state) {
+            const v = videoRef.current
+            if (!v) return
+            if (state === 'STOP') {
+              // Agent finished talking => show pre-rendered idle video
+              const idleUrl = managerRef.current?.agent?.presenter?.idle_video
+              v.srcObject = null
+              v.loop = true
+              v.src = idleUrl || ''
+              if (idleUrl) v.play().catch(() => {})
+            } else {
+              // state === 'START' -- agent is talking => switch to live WebRTC stream
+              v.loop = false
+              v.src = ''
+              v.srcObject = srcObjectRef.current
+              v.play().catch((e) => console.warn('video.play() [START]:', e))
+            }
+            if (isDebug) {
+              setDebug((prev) => ({ ...prev, lastEvent: `onVideoStateChange(${state})` }))
+              updateVideoDebug()
+            }
+          },
+
           onConnectionStateChange(state) {
             if (cancelledRef.current) return
+            if (isDebug)
+              setDebug((prev) => ({
+                ...prev,
+                connState: state,
+                lastEvent: `onConnectionStateChange(${state})`,
+              }))
             if (state === 'connected') {
               setStatus('live')
-              // CLAIM handshake — backend reads it from messages[0] and binds
-              // the D-ID externalId/distinct-id to the Notion guest.
-              if (!claimSentRef.current && sessionConfig.claim_marker) {
-                claimSentRef.current = true
-                manager.chat(sessionConfig.claim_marker).catch((err) => {
-                  console.warn('CLAIM handshake failed:', err)
-                })
-              }
             } else if (
-              // SDK terminal states. The official name is `'failed'` (not
-              // `'fail'`); `'closed'` and `'disconnected'` are also terminal
-              // for an AgentManager session.
-              state === 'failed' ||
+              // SDK uses 'fail', NOT 'failed'
+              state === 'fail' ||
               state === 'closed' ||
               state === 'disconnected'
             ) {
               setStatus('error')
               setErrorMsg('Verbindung verloren.')
+              if (isDebug) pushDebugError(`Connection terminal: ${state}`)
             }
           },
+
           onNewMessage(messages, type) {
             if (!messages || messages.length === 0) return
             const last = messages[messages.length - 1]
-            // Hide the silent CLAIM handshake from the visible transcript
             if (
               last.role === 'user' &&
               typeof last.content === 'string' &&
@@ -150,8 +215,6 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             ) {
               return
             }
-            // Only forward terminal turns to keep the parent simple; partials
-            // would re-fire many times per second.
             if (type === 'answer' || type === 'user') {
               onMessage?.({
                 role: last.role === 'assistant' ? 'assistant' : 'user',
@@ -159,11 +222,16 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
               })
             }
           },
-          onError(err) {
-            console.error('D-ID SDK error:', err)
+
+          onError(err, errorData) {
+            console.error('D-ID SDK error:', err, errorData)
             if (cancelledRef.current) return
             setStatus('error')
             setErrorMsg(err?.message || 'Unbekannter Fehler.')
+            if (isDebug) {
+              const extra = errorData ? ' | ' + JSON.stringify(errorData) : ''
+              pushDebugError(`SDK: ${err?.message}${extra}`)
+            }
           },
         },
       })
@@ -175,24 +243,51 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       managerRef.current = manager
       await manager.connect()
 
+      // Send CLAIM/greeting AFTER connect() resolves -- calling chat() inside the
+      // onConnectionStateChange callback (while connect() is still executing) can
+      // silently fail because the internal chat session isn't fully ready yet.
+      if (sessionConfig.claim_marker && !claimSentRef.current) {
+        claimSentRef.current = true
+        const ts = new Date().toISOString()
+        if (isDebug)
+          setDebug((prev) => ({ ...prev, claimSent: true, claimTs: ts, claimResult: 'pending...' }))
+        manager.chat(sessionConfig.claim_marker).then(
+          () => {
+            if (isDebug) setDebug((prev) => ({ ...prev, claimResult: 'ok' }))
+          },
+          (err) => {
+            console.warn('CLAIM handshake failed:', err)
+            if (isDebug) {
+              setDebug((prev) => ({ ...prev, claimResult: `error: ${err?.message}` }))
+              pushDebugError(`CLAIM: ${err?.message}`)
+            }
+          },
+        )
+      }
+
+      // Publish mic after connect
       if (micStream) {
         if (!manager.publishMicrophoneStream) {
-          // SDK variant without mic support — stop the captured tracks so the
-          // OS mic indicator doesn't lie about a live recording.
-          console.warn('publishMicrophoneStream not supported by this SDK')
+          // V2/V3 (non-Expressive) agents don't support mic streaming.
+          console.warn('publishMicrophoneStream not supported (V2/V3 agent)')
           micStream.getTracks().forEach((t) => t.stop())
           micStreamRef.current = null
           setMicActive(false)
+          if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'not supported (V2/V3)' }))
         } else {
           try {
             await manager.publishMicrophoneStream(micStream)
-            // Publish succeeded — `micActive` may have been set true on capture,
-            // we leave it as-is.
+            if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'ok' }))
           } catch (err) {
             console.warn('publishMicrophoneStream failed:', err)
+            setMicError(`Mic: ${err?.message || err}`)
             micStream.getTracks().forEach((t) => t.stop())
             micStreamRef.current = null
             setMicActive(false)
+            if (isDebug) {
+              setDebug((prev) => ({ ...prev, micPublish: `error: ${err?.message}` }))
+              pushDebugError(`publishMic: ${err?.message}`)
+            }
           }
         }
       }
@@ -201,6 +296,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       if (cancelledRef.current) return
       setStatus('error')
       setErrorMsg(err?.message || 'Verbindung fehlgeschlagen.')
+      if (isDebug) pushDebugError(`setup: ${err?.message}`)
       if (micStreamRef.current) {
         micStreamRef.current.getTracks().forEach((t) => t.stop())
         micStreamRef.current = null
@@ -214,9 +310,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     if (!v) return
     v.muted = false
     setMuted(false)
-    v.play().catch((err) => {
-      console.warn('unmute play() failed:', err)
-    })
+    v.play().catch((e) => console.warn('unmute play() failed:', e))
   }
 
   const toggleMic = async () => {
@@ -237,12 +331,14 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true })
     } catch (err) {
+      const label = `${err.name}: ${err.message}`
       console.warn('mic toggle: getUserMedia failed:', err)
+      setMicError(label)
+      if (isDebug) pushDebugError(`toggleMic getUserMedia: ${label}`)
       return
     }
     if (!manager.publishMicrophoneStream) {
-      // SDK can't publish — don't pretend the mic is live.
-      console.warn('publishMicrophoneStream not supported by this SDK')
+      console.warn('publishMicrophoneStream not supported')
       stream.getTracks().forEach((t) => t.stop())
       return
     }
@@ -250,16 +346,20 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       await manager.publishMicrophoneStream(stream)
       micStreamRef.current = stream
       setMicActive(true)
+      setMicError('')
+      if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'ok (toggle)' }))
     } catch (err) {
-      console.warn('publishMicrophoneStream failed:', err)
+      console.warn('publishMicrophoneStream (toggle) failed:', err)
       stream.getTracks().forEach((t) => t.stop())
+      setMicError(`Mic: ${err?.message || err}`)
+      if (isDebug) {
+        pushDebugError(`toggleMic publish: ${err?.message}`)
+        setDebug((prev) => ({ ...prev, micPublish: `toggle error: ${err?.message}` }))
+      }
     }
   }
 
-  // Expose a programmatic send to the parent (text-chat fallback). When the
-  // manager isn't live (teardown, error, disconnect), signal `null` so the
-  // parent can drop the stale reference and fall back to /api/chat instead of
-  // calling into a dead SDK handle.
+  // Expose programmatic send to parent
   useEffect(() => {
     if (!onReady) return
     if (managerRef.current && status === 'live') {
@@ -275,9 +375,16 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     }
   }, [status, onReady])
 
+  // Refresh video debug stats while overlay is visible
+  useEffect(() => {
+    if (!isDebug || status !== 'live') return
+    const id = setInterval(updateVideoDebug, 1000)
+    return () => clearInterval(id)
+  }, [isDebug, status, updateVideoDebug])
+
   return (
     <div className="relative w-full max-w-xs aspect-[3/4] rounded-2xl overflow-hidden shadow-2xl bg-gray-800 ring-1 ring-gray-700/50">
-      {/* Video */}
+      {/* Video -- always in DOM; idle_video shows via src, live stream via srcObject */}
       <video
         ref={videoRef}
         autoPlay
@@ -305,8 +412,11 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3zM19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8" />
             </svg>
-            {status === 'requesting' ? 'Mikrofon…' : 'Gespräch starten'}
+            {status === 'requesting' ? 'Mikrofon...' : 'Gespräch starten'}
           </button>
+          {micError && (
+            <p className="text-[10px] text-red-400 text-center max-w-[200px] leading-snug">{micError}</p>
+          )}
           <p className="text-[10px] text-gray-600 text-center max-w-[200px] leading-snug">
             Tippe, um Mikrofon und Audio zu erlauben.
           </p>
@@ -317,7 +427,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       {status === 'connecting' && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-gradient-to-b from-gray-800 to-gray-900">
           <div className="w-12 h-12 rounded-full border-2 border-violet-500/40 border-t-violet-400 animate-spin" />
-          <p className="text-xs text-gray-400">Avatar verbindet …</p>
+          <p className="text-xs text-gray-400">Avatar verbindet ...</p>
         </div>
       )}
 
@@ -349,7 +459,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         </div>
       )}
 
-      {/* Unmute overlay — iOS Safari only autoplays muted */}
+      {/* Unmute overlay -- iOS Safari only autoplays muted */}
       {status === 'live' && muted && (
         <button
           type="button"
@@ -376,10 +486,13 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
           <button
             type="button"
             onClick={toggleMic}
+            title={micError || undefined}
             className={`flex items-center gap-1.5 px-3 py-1 rounded-full backdrop-blur-sm text-xs transition-colors ${
               micActive
                 ? 'bg-emerald-500/30 text-emerald-300 ring-1 ring-emerald-500/40'
-                : 'bg-black/50 text-gray-400 hover:bg-black/70'
+                : micError
+                  ? 'bg-red-500/20 text-red-400 ring-1 ring-red-500/30'
+                  : 'bg-black/50 text-gray-400 hover:bg-black/70'
             }`}
             aria-label={micActive ? 'Mikrofon stumm schalten' : 'Mikrofon aktivieren'}
           >
@@ -388,6 +501,34 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             </svg>
             {micActive ? 'Mic an' : 'Mic aus'}
           </button>
+        </div>
+      )}
+
+      {/* Debug overlay -- only visible with ?debug=1 */}
+      {isDebug && (status === 'connecting' || status === 'live' || status === 'error') && (
+        <div className="absolute top-2 left-2 right-2 bg-black/75 text-[9px] font-mono text-green-300 p-2 rounded-lg leading-[1.4] pointer-events-none select-none z-50">
+          <div>conn: <span className="text-white">{debug.connState}</span></div>
+          <div>evt: <span className="text-yellow-300">{debug.lastEvent}</span></div>
+          <div>
+            video: rs=<span className="text-white">{debug.videoReadyState}</span>{' '}
+            <span className="text-white">{debug.videoWidth}x{debug.videoHeight}</span>{' '}
+            v=<span className="text-white">{debug.videoTracks}</span>{' '}
+            a=<span className="text-white">{debug.audioTracks}</span>
+          </div>
+          <div>mic: perm=<span className="text-white">{debug.micPermission}</span> pub=<span className="text-white">{debug.micPublish}</span></div>
+          <div>
+            claim:{' '}
+            {debug.claimSent
+              ? <><span className="text-white">{debug.claimTs.slice(11, 19)}</span> {'->'} <span className={debug.claimResult === 'ok' ? 'text-emerald-400' : 'text-white'}>{debug.claimResult}</span></>
+              : <span className="text-gray-500">not sent</span>}
+          </div>
+          {debug.errors.length > 0 && (
+            <div className="mt-1 border-t border-green-900 pt-1">
+              {debug.errors.map((e, i) => (
+                <div key={i} className="text-red-400 truncate">{e}</div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
