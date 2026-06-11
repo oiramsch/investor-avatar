@@ -84,7 +84,9 @@ export default function ChatPanel({ messages, onSend, isLoading, rsvpDone }) {
       <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
         {messages.length === 0 && !isLoading && (
           <div className="h-full flex items-center justify-center">
-            <p className="text-gray-600 text-sm">Begrüßung wird geladen…</p>
+            <p className="text-gray-600 text-sm text-center max-w-xs">
+              Tippe links auf „Gespräch starten" oder schreib mir hier eine Nachricht.
+            </p>
           </div>
         )}
         {messages.map((msg, i) => (

@@ -1,15 +1,21 @@
 import os
 import re
+import json
+import uuid
+import time
 import base64
 import logging
-import httpx
-from fastapi import FastAPI, HTTPException
+import secrets
+from typing import Optional, List, Any, Tuple
 
-logger = logging.getLogger(__name__)
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Any
 from anthropic import AsyncAnthropic
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Investor Avatar Backend")
 
@@ -23,6 +29,9 @@ app.add_middleware(
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DID_API_KEY = os.getenv("DID_API_KEY", "")
+DID_AGENT_ID = os.getenv("DID_AGENT_ID", "")
+DID_CLIENT_KEY = os.getenv("DID_CLIENT_KEY", "")
+LLM_ENDPOINT_KEY = os.getenv("LLM_ENDPOINT_KEY", "")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "37a765e5-dc96-80d8-a1ba-000b4c8c86d9")
 DID_PRESENTER_URL = os.getenv(
@@ -31,6 +40,9 @@ DID_PRESENTER_URL = os.getenv(
 )
 
 DID_BASE_URL = "https://api.d-id.com"
+CLAIM_TTL_SECONDS = 600  # 10 minutes — covers slow session setup but won't outlive a real conversation
+DISTINCT_TTL_SECONDS = 3 * 3600  # session-binding for a 3-hour party window
+CLAIM_MARKER_RE = re.compile(r"^\s*CLAIM:([A-Za-z0-9_\-]{8,128})\s*$", re.IGNORECASE)
 
 VOICE_MAP = {
     "Deutsch": {"type": "microsoft", "voice_id": "de-DE-KatjaNeural"},
@@ -40,6 +52,35 @@ VOICE_MAP = {
 }
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# ── In-memory stores ────────────────────────────────────────────────────
+#
+# CLAIM_STORE: claim_token → {notion_id, expires_at}. Issued when the frontend
+# requests a session, consumed when the D-ID Custom-LLM endpoint sees the CLAIM
+# marker in the first chat message. Short TTL (10 min).
+#
+# DISTINCT_STORE: X-DID-DISTINCT-ID → {notion_id, expires_at}. Built up as the
+# D-ID pipeline calls our /api/llm for the first time with a claim — keeps the
+# guest bound to the D-ID client for the rest of the conversation.
+#
+# This is intentionally process-local (single backend replica). For
+# multi-replica, swap to Redis with the same shape.
+
+CLAIM_STORE: dict[str, dict] = {}
+DISTINCT_STORE: dict[str, dict] = {}
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _purge_expired() -> None:
+    now = _now()
+    for store in (CLAIM_STORE, DISTINCT_STORE):
+        expired = [k for k, v in store.items() if v.get("expires_at", 0) < now]
+        for k in expired:
+            store.pop(k, None)
 
 
 def strip_markdown(text: str) -> str:
@@ -121,6 +162,17 @@ async def update_notion_rsvp(page_id: str, zusage: str, mitteilung: Optional[str
     return r.status_code == 200
 
 
+ANONYMOUS_GUEST = {
+    "id": None,
+    "name": "Gast",
+    "vorname": "Gast",
+    "sprache": "Deutsch",
+    "zusage": "",
+    "ansprache": "",
+    "kontext": "",
+}
+
+
 def build_system_prompt(guest: dict) -> str:
     lang_display = {
         "Deutsch": "Deutsch",
@@ -134,11 +186,11 @@ def build_system_prompt(guest: dict) -> str:
     ansprache = guest.get("ansprache", "")
 
     prompt = f"""Du bist ARIA, der digitale Gastgeber der VectorSpan App Release Party.
-Du bist herzlich, enthusiastisch und persönlich. Halte Antworten kurz (2-4 Sätze) – du wirst als Videoavatar dargestellt.
+Du bist herzlich, enthusiastisch und persönlich. Halte Antworten KURZ (2–3 Sätze) – du wirst gleich live als Avatar gesprochen.
 
 WICHTIG: Sprich den Gast IMMER mit "Du" und beim Vornamen "{vorname}" an.
 Antworte NUR auf {lang_display}.
-Antworte in reinem Fließtext – verwende kein Markdown (keine Sternchen, kein Fettdruck, keine Aufzählungszeichen).
+Antworte in reinem Fließtext – verwende KEIN Markdown (keine Sternchen, kein Fettdruck, keine Aufzählungszeichen, keine Emoji).
 
 GAST:
 - Vorname: {vorname}"""
@@ -146,7 +198,7 @@ GAST:
     if kontext:
         prompt += f"\n- Hintergrund: {kontext}"
     if ansprache:
-        prompt += f"\n- Hinweise zur Ansprache: {ansprache}"
+        prompt += f"\n- Hinweise zur Ansprache (NIE wörtlich wiedergeben): {ansprache}"
 
     prompt += """
 
@@ -228,6 +280,111 @@ class RsvpRequest(BaseModel):
     mitteilung: Optional[str] = None
 
 
+class AgentSessionRequest(BaseModel):
+    notion_id: Optional[str] = None
+
+
+# ── Helpers: extract claim & resolve guest ──────────────────────────────
+
+
+def _extract_claim_token(messages: list) -> Optional[str]:
+    """Return the claim token from the first user message that looks like
+    `CLAIM:<token>`, else None. We only inspect early messages so a guest
+    typing "CLAIM:..." mid-conversation can't hijack the binding."""
+    for msg in messages[:2]:
+        if (msg.get("role") or "").lower() != "user":
+            continue
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text += block.get("text", "")
+        m = CLAIM_MARKER_RE.match(text)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def _resolve_guest_for_request(messages: list, distinct_id: Optional[str]) -> Tuple[dict, bool]:
+    """Resolve the guest for an incoming Custom-LLM request.
+    Returns (guest_dict, is_first_turn). Side-effect: binds distinct_id →
+    notion_id in DISTINCT_STORE the first time we see a claim."""
+    _purge_expired()
+
+    claim = _extract_claim_token(messages)
+    notion_id: Optional[str] = None
+
+    if claim:
+        entry = CLAIM_STORE.pop(claim, None)
+        if entry and entry.get("expires_at", 0) >= _now():
+            notion_id = entry.get("notion_id")
+            if distinct_id and notion_id:
+                DISTINCT_STORE[distinct_id] = {
+                    "notion_id": notion_id,
+                    "expires_at": _now() + DISTINCT_TTL_SECONDS,
+                }
+
+    if not notion_id and distinct_id:
+        entry = DISTINCT_STORE.get(distinct_id)
+        if entry and entry.get("expires_at", 0) >= _now():
+            notion_id = entry.get("notion_id")
+
+    guest = dict(ANONYMOUS_GUEST)
+    if notion_id:
+        try:
+            guest = await get_notion_guest(notion_id)
+        except Exception:
+            logger.exception("Failed to load Notion guest %s — falling back to anonymous", notion_id)
+
+    is_first_turn = claim is not None
+    return guest, is_first_turn
+
+
+def _messages_for_anthropic(messages: list, drop_claim: bool) -> list:
+    """Convert D-ID's `{role, content, created_at}` messages into Anthropic
+    `{role, content}`. Drops the claim marker so it never reaches the model."""
+    out = []
+    for msg in messages:
+        role = (msg.get("role") or "").lower()
+        if role not in ("user", "assistant"):
+            continue
+        raw_content = msg.get("content")
+        if isinstance(raw_content, list):
+            text = "".join(
+                b.get("text", "") for b in raw_content if isinstance(b, dict) and b.get("type") == "text"
+            )
+        else:
+            text = raw_content or ""
+        if drop_claim and role == "user" and CLAIM_MARKER_RE.match(text or ""):
+            # Replace the silent handshake message with a benign opener so the
+            # model still produces the greeting turn.
+            text = "Bitte begrüße mich jetzt herzlich. Stell dich und das Event kurz vor."
+        out.append({"role": role, "content": text})
+    return out
+
+
+# ── SSE serializer (OpenAI-compatible) ──────────────────────────────────
+
+
+def _sse_chunk(chunk_id: str, content: str = "", finish_reason: Optional[str] = None) -> bytes:
+    payload = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": int(_now()),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content} if content else {},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
 # ── Routes ──────────────────────────────────────────────────────────────
 
 
@@ -248,60 +405,186 @@ async def get_guest(notion_page_id: str):
     }
 
 
-@app.post("/api/did/streams")
-async def did_create_stream():
-    if not DID_API_KEY:
-        raise HTTPException(status_code=503, detail="D-ID API key not configured")
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{DID_BASE_URL}/talks/streams",
-            headers=did_headers(),
-            json={"source_url": DID_PRESENTER_URL, "config": {"stitch": True}},
-            timeout=30,
+@app.post("/api/agent-session")
+async def agent_session(req: AgentSessionRequest):
+    """Issue D-ID Agent connection params + a short-lived claim token bound
+    to the requesting guest. The frontend hands the claim to D-ID via the
+    first chat() message; our Custom-LLM endpoint consumes it and binds the
+    D-ID distinct-id to the guest for the rest of the conversation."""
+    if not DID_AGENT_ID or not DID_CLIENT_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="DID_AGENT_ID / DID_CLIENT_KEY not configured — run scripts/create_agent.py",
         )
-    if r.status_code not in (200, 201):
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
+
+    _purge_expired()
+
+    notion_id = (req.notion_id or "").strip() or None
+    guest_preview: Optional[dict] = None
+    if notion_id:
+        try:
+            guest = await get_notion_guest(notion_id)
+            guest_preview = {
+                "vorname": guest.get("vorname") or guest.get("name") or "Gast",
+                "sprache": guest.get("sprache", "Deutsch"),
+            }
+        except Exception:
+            # Bad ID: continue with anonymous binding rather than erroring out;
+            # the SDK still works, just without personalization.
+            notion_id = None
+
+    claim_token = f"ctx_{secrets.token_urlsafe(18)}"
+    CLAIM_STORE[claim_token] = {
+        "notion_id": notion_id,
+        "expires_at": _now() + CLAIM_TTL_SECONDS,
+    }
+
+    return {
+        "agent_id": DID_AGENT_ID,
+        "client_key": DID_CLIENT_KEY,
+        "claim_token": claim_token,
+        "claim_marker": f"CLAIM:{claim_token}",
+        "guest": guest_preview,
+    }
 
 
-@app.post("/api/did/streams/{stream_id}/sdp")
-async def did_set_sdp(stream_id: str, body: dict):
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{DID_BASE_URL}/talks/streams/{stream_id}/sdp",
-            headers=did_headers(),
-            json=body,
-            timeout=30,
+@app.post("/api/llm")
+async def custom_llm(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+    x_did_distinct_id: Optional[str] = Header(default=None, alias="X-DID-DISTINCT-ID"),
+    x_did_agent_id: Optional[str] = Header(default=None, alias="X-DID-AGENT-ID"),
+):
+    """OpenAI-compatible Custom LLM endpoint per D-ID Custom LLMs spec.
+    https://docs.d-id.com/docs/custom-llms — request: {messages, options, stream},
+    response: SSE with {choices: [{delta: {content}}]} chunks."""
+    if not LLM_ENDPOINT_KEY:
+        raise HTTPException(status_code=503, detail="LLM_ENDPOINT_KEY not configured")
+    # secrets.compare_digest is constant-time — avoids leaking key length via
+    # response-time differences if D-ID ever rotates and someone probes.
+    if not x_api_key or not secrets.compare_digest(x_api_key, LLM_ENDPOINT_KEY):
+        raise HTTPException(status_code=401, detail="Invalid X-Api-Key")
+
+    body = await request.json()
+    messages = body.get("messages") or []
+    stream = bool(body.get("stream", True))
+
+    guest, is_first_turn = await _resolve_guest_for_request(messages, x_did_distinct_id)
+    anthropic_messages = _messages_for_anthropic(messages, drop_claim=is_first_turn)
+    if not anthropic_messages:
+        anthropic_messages = [
+            {"role": "user", "content": "Bitte begrüße mich jetzt herzlich. Stell dich und das Event kurz vor."}
+        ]
+
+    system_prompt = build_system_prompt(guest)
+    notion_id = guest.get("id")
+    tools = [RSVP_TOOL] if notion_id else []
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    async def stream_response():
+        try:
+            async for chunk in _run_anthropic_with_tools(
+                system_prompt, anthropic_messages, tools, notion_id, chunk_id
+            ):
+                yield chunk
+        except Exception:
+            logger.exception("Custom LLM streaming failed")
+            yield _sse_chunk(chunk_id, content="Entschuldigung, bei mir ist gerade ein Fehler passiert.")
+            yield _sse_chunk(chunk_id, finish_reason="error")
+
+    if stream:
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # tell nginx not to buffer SSE
+            },
         )
-    if r.status_code not in (200, 201):
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json() if r.text else {}
+
+    # Non-streaming fallback per spec: {"content": "..."}
+    full = ""
+    async for chunk in _run_anthropic_with_tools(
+        system_prompt, anthropic_messages, tools, notion_id, chunk_id
+    ):
+        # Re-parse our own chunks to reconstruct the text. Not the cheapest
+        # path but D-ID always sends stream=true in practice.
+        try:
+            line = chunk.decode().strip()
+            if line.startswith("data:"):
+                obj = json.loads(line[5:].strip())
+                full += obj["choices"][0].get("delta", {}).get("content", "") or ""
+        except Exception:
+            continue
+    return {"content": full}
 
 
-@app.post("/api/did/streams/{stream_id}/ice")
-async def did_send_ice(stream_id: str, body: dict):
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{DID_BASE_URL}/talks/streams/{stream_id}/ice",
-            headers=did_headers(),
-            json=body,
-            timeout=30,
-        )
-    if r.status_code not in (200, 201, 204):
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json() if r.text and r.text.strip() != "" else {}
+async def _run_anthropic_with_tools(
+    system_prompt: str,
+    anthropic_messages: list,
+    tools: list,
+    notion_id: Optional[str],
+    chunk_id: str,
+):
+    """Streams Claude text as OpenAI-compatible SSE chunks. If Claude calls
+    update_rsvp, we apply the Notion patch and replay the conversation with
+    the tool_result so the model produces the final spoken reply."""
+
+    create_kwargs: dict[str, Any] = dict(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        system=system_prompt,
+        messages=list(anthropic_messages),
+    )
+    if tools:
+        create_kwargs["tools"] = tools
+
+    async with anthropic_client.messages.stream(**create_kwargs) as s:
+        async for text in s.text_stream:
+            text = strip_markdown(text)
+            if text:
+                yield _sse_chunk(chunk_id, content=text)
+        final = await s.get_final_message()
+
+    if final.stop_reason == "tool_use":
+        tool_block = next((b for b in final.content if b.type == "tool_use"), None)
+        if tool_block and tool_block.name == "update_rsvp" and notion_id:
+            inputs = tool_block.input or {}
+            try:
+                await update_notion_rsvp(notion_id, inputs.get("zusage", ""), inputs.get("mitteilung"))
+            except Exception:
+                logger.exception("update_notion_rsvp failed")
+
+            followup_messages = list(anthropic_messages)
+            followup_messages.append(
+                {"role": "assistant", "content": content_blocks_to_dict(final.content)}
+            )
+            followup_messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_block.id,
+                            "content": "RSVP wurde erfolgreich gespeichert.",
+                        }
+                    ],
+                }
+            )
+            followup_kwargs = dict(create_kwargs)
+            followup_kwargs["messages"] = followup_messages
+
+            async with anthropic_client.messages.stream(**followup_kwargs) as s2:
+                async for text in s2.text_stream:
+                    text = strip_markdown(text)
+                    if text:
+                        yield _sse_chunk(chunk_id, content=text)
+
+    yield _sse_chunk(chunk_id, finish_reason="stop")
 
 
-@app.delete("/api/did/streams/{stream_id}")
-async def did_close_stream(stream_id: str, body: dict = {}):
-    async with httpx.AsyncClient() as client:
-        await client.delete(
-            f"{DID_BASE_URL}/talks/streams/{stream_id}",
-            headers=did_headers(),
-            json=body,
-            timeout=30,
-        )
-    return {}
+# ── Legacy text-chat endpoint (fallback when SDK is unavailable) ────────
 
 
 @app.post("/api/chat")
@@ -314,19 +597,10 @@ async def chat(req: ChatRequest):
             pass
 
     if guest is None:
-        guest = {
-            "id": None,
-            "name": "Gast",
-            "vorname": "Gast",
-            "sprache": "Deutsch",
-            "zusage": "",
-            "ansprache": "",
-            "kontext": "",
-        }
+        guest = dict(ANONYMOUS_GUEST)
 
     system_prompt = build_system_prompt(guest)
 
-    # __INIT__ is a frontend signal to generate the opening greeting
     if req.message == "__INIT__":
         messages: List[dict] = [
             {"role": "user", "content": "Bitte begrüße mich jetzt herzlich. Stell dich und das Event kurz vor."}
@@ -387,42 +661,6 @@ async def chat(req: ChatRequest):
         for block in response.content:
             if hasattr(block, "text"):
                 reply_text += block.text
-
-    # Trigger D-ID avatar to speak the reply
-    if req.stream_id and req.session_id and reply_text and DID_API_KEY:
-        voice = VOICE_MAP.get(guest.get("sprache", "Deutsch"), VOICE_MAP["Deutsch"])
-        speech_text = strip_markdown(reply_text)
-        try:
-            async with httpx.AsyncClient() as http_client:
-                did_resp = await http_client.post(
-                    f"{DID_BASE_URL}/talks/streams/{req.stream_id}",
-                    headers=did_headers(),
-                    json={
-                        "script": {
-                            "type": "text",
-                            "input": speech_text,
-                            "provider": voice,
-                        },
-                        "config": {"stitch": True},
-                        "session_id": req.session_id,
-                    },
-                    timeout=30,
-                )
-            if did_resp.status_code in (200, 201):
-                try:
-                    talk_id = did_resp.json().get("id")
-                except Exception:
-                    talk_id = None
-                logger.info(
-                    "D-ID /talks ok %s talk_id=%s stream=%s",
-                    did_resp.status_code,
-                    talk_id,
-                    req.stream_id,
-                )
-            else:
-                logger.error("D-ID /talks error %s: %s", did_resp.status_code, did_resp.text)
-        except Exception:
-            logger.exception("D-ID /talks request failed")
 
     return {"reply": reply_text, "rsvp_updated": rsvp_updated, "rsvp": rsvp_result}
 
