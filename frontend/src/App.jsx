@@ -23,9 +23,22 @@ export default function App() {
   }, [notionId])
 
   // Avatar exposes either `{guest}` (one-time on session ready) or
-  // `{sendText}` (each render once the manager is up). We merge both.
+  // `{sendText}` (each render once the manager is up). We merge both, and
+  // accept `null` so the chat falls back to /api/chat cleanly when the
+  // avatar's SDK handle goes away (teardown/error/unmount).
   const handleAvatarReady = useCallback((api) => {
-    if (api?.sendText) avatarApiRef.current = api
+    if (api === null) {
+      avatarApiRef.current = null
+      return
+    }
+    if (api?.sendText) {
+      avatarApiRef.current = api
+    }
+    // Use the backend-provided guest preview as a fallback when /api/guest
+    // didn't return one (e.g. no `id` query param, or that lookup failed).
+    if (api?.guest) {
+      setGuest((prev) => prev ?? api.guest)
+    }
   }, [])
 
   const handleAvatarMessage = useCallback((msg) => {

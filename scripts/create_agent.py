@@ -5,14 +5,20 @@ What it does:
 1. Looks up the agent named `AGENT_NAME` (default "VectorSpan Release Party").
    - If found → updates its LLM/presenter config.
    - If not found → creates it.
-2. Ensures a long-lived client-key exists for that agent (creates one if none
-   match `CLIENT_KEY_NAME`).
-3. Prints `DID_AGENT_ID` and `DID_CLIENT_KEY` for your `.env`.
+   - If the lookup itself fails (network/auth) → exits with an error rather
+     than silently creating a duplicate.
+2. Ensures a long-lived client-key exists for that agent.
+   - If `DID_CLIENT_KEY` is already present in env/.env → reuses it
+     (D-ID only reveals the secret once at creation time, so persisting
+     it locally is the only way to stay idempotent).
+   - Otherwise mints a fresh key, writes it to `.env`, and prints it.
+3. Writes `DID_AGENT_ID` and `DID_CLIENT_KEY` back into `.env`.
 
 Env required:
 - DID_API_KEY      D-ID API key (read from .env in repo root if present)
 - LLM_ENDPOINT_KEY shared secret your /api/llm checks against
 - LLM_URL          custom-LLM URL D-ID will POST to (default: https://party.vectorspan.io/api/llm)
+- DID_CLIENT_KEY   optional — set to reuse a previously minted key
 - AGENT_NAME       optional, default "VectorSpan Release Party"
 - ALLOWED_DOMAIN   optional, default "party.vectorspan.io" (CSV for multiple)
 - PRESENTER_ID     optional, default "noelle-c2nQB6Cy11"  (D-ID stock presenter)
@@ -47,6 +53,36 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(k, v)
 
 
+def persist_dotenv(path: Path, updates: dict[str, str]) -> None:
+    """Idempotently set keys in .env. Updates existing lines in-place and
+    appends new keys at the end. Quotes values that contain whitespace or
+    shell metacharacters to keep them re-loadable."""
+    lines: list[str] = []
+    if path.exists():
+        lines = path.read_text().splitlines()
+    seen: set[str] = set()
+
+    def fmt(k: str, v: str) -> str:
+        needs_quote = any(c in v for c in " \t\"'#$`\\")
+        if needs_quote:
+            v = v.replace("\\", "\\\\").replace('"', '\\"')
+            return f'{k}="{v}"'
+        return f"{k}={v}"
+
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k = s.split("=", 1)[0].strip()
+        if k in updates:
+            lines[i] = fmt(k, updates[k])
+            seen.add(k)
+    for k, v in updates.items():
+        if k not in seen:
+            lines.append(fmt(k, v))
+    path.write_text("\n".join(lines) + "\n")
+
+
 def did_auth_header(api_key: str) -> dict:
     encoded = base64.b64encode(f"{api_key}:".encode()).decode()
     return {
@@ -58,10 +94,12 @@ def did_auth_header(api_key: str) -> dict:
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
-    load_dotenv(repo_root / ".env")
+    dotenv_path = repo_root / ".env"
+    load_dotenv(dotenv_path)
 
     api_key = os.getenv("DID_API_KEY", "").strip()
     llm_key = os.getenv("LLM_ENDPOINT_KEY", "").strip()
+    existing_client_key = os.getenv("DID_CLIENT_KEY", "").strip() or None
     if not api_key:
         print("ERROR: DID_API_KEY not set (in .env or environment)", file=sys.stderr)
         return 2
@@ -148,27 +186,45 @@ def main() -> int:
                 print(f"ERROR: response missing agent id: {r.text}", file=sys.stderr)
                 return 1
 
-        client_key = _ensure_client_key(client, headers, agent_id, client_key_name, allowed_domains)
+        client_key, created_new_key = _ensure_client_key(
+            client, headers, agent_id, client_key_name, allowed_domains, existing_client_key
+        )
+
+    # Persist the resolved values so re-running the script (or any other
+    # service relying on .env) picks them up automatically. We only touch
+    # keys we actually set — never overwrite secrets we didn't compute.
+    persist_dotenv(dotenv_path, {"DID_AGENT_ID": agent_id, "DID_CLIENT_KEY": client_key})
 
     print()
     print("=" * 64)
-    print("Agent provisioned. Add these to your .env:")
+    print("Agent provisioned.")
     print("=" * 64)
     print(f"DID_AGENT_ID={agent_id}")
-    print(f"DID_CLIENT_KEY={client_key}")
+    if created_new_key:
+        print(f"DID_CLIENT_KEY={client_key}  # newly created — written to {dotenv_path.name}")
+    else:
+        print(f"DID_CLIENT_KEY=<reused>     # already present in {dotenv_path.name}")
     print(f"LLM_ENDPOINT_KEY={llm_key}  # unchanged — D-ID stores it server-side")
     print()
     return 0
 
 
 def _find_agent_by_name(client: httpx.Client, headers: dict, name: str) -> dict | None:
-    r = client.get("https://api.d-id.com/agents", headers=headers)
+    """Returns the agent dict if found, None if the agent does NOT exist.
+    Raises RuntimeError on any other failure (network, auth, etc.) so we
+    don't silently fall through to creating a duplicate."""
+    try:
+        r = client.get("https://api.d-id.com/agents", headers=headers)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"agent lookup failed: {exc}") from exc
     if r.status_code != 200:
-        return None
+        raise RuntimeError(
+            f"agent lookup returned {r.status_code}: {r.text} — refusing to create a duplicate"
+        )
     data = r.json()
     agents = data.get("agents") if isinstance(data, dict) else data
     if not isinstance(agents, list):
-        return None
+        raise RuntimeError(f"agent lookup: unexpected response shape: {data!r}")
     for a in agents:
         if a.get("preview_name") == name:
             return a
@@ -181,19 +237,35 @@ def _ensure_client_key(
     agent_id: str,
     key_name: str,
     allowed_domains: list[str],
-) -> str:
-    # Reuse an existing key by name if one is present — keys are stored
-    # one-way (creation returns the secret once), so if we don't find it we
-    # have to create a new one.
+    existing_env_key: str | None,
+) -> tuple[str, bool]:
+    """Returns (client_key, created_new). Reuses the value already in env
+    (DID_CLIENT_KEY) if present, since D-ID only reveals secrets once at
+    creation time and listing keys later does not return the secret."""
+    if existing_env_key:
+        print(f"→ reusing DID_CLIENT_KEY from environment (length {len(existing_env_key)})")
+        return existing_env_key, False
+
+    # Best-effort: check if a key with our name already exists server-side.
+    # If it does but the secret isn't available locally, fail with an
+    # actionable message rather than silently piling up duplicate keys.
     r = client.get(f"https://api.d-id.com/agents/{agent_id}/client-keys", headers=headers)
     if r.status_code == 200:
         body = r.json()
         keys = body.get("client_keys") if isinstance(body, dict) else body
         if isinstance(keys, list):
             for k in keys:
-                if k.get("name") == key_name and k.get("client_key"):
-                    print(f"→ reusing client-key '{key_name}'")
-                    return k["client_key"]
+                if k.get("name") == key_name:
+                    secret = k.get("client_key")
+                    if secret:
+                        print(f"→ server returned secret for key '{key_name}'")
+                        return secret, False
+                    raise RuntimeError(
+                        f"client-key '{key_name}' already exists on agent {agent_id} but the secret is not "
+                        "available here (D-ID only returns it once at creation). Either set DID_CLIENT_KEY "
+                        "in .env from where it was originally captured, or delete the existing key in the "
+                        "D-ID console and re-run this script to mint a fresh one."
+                    )
 
     print(f"→ creating client-key '{key_name}' for domains {allowed_domains}")
     r = client.post(
@@ -203,7 +275,7 @@ def _ensure_client_key(
     )
     if r.status_code not in (200, 201):
         raise RuntimeError(f"client-key creation failed {r.status_code}: {r.text}")
-    return r.json()["client_key"]
+    return r.json()["client_key"], True
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   // 1) Fetch session config from backend on mount
   useEffect(() => {
     cancelledRef.current = false
+    // New session config → fresh handshake must fire again.
+    claimSentRef.current = false
     fetch('/api/agent-session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -125,7 +127,14 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
                   console.warn('CLAIM handshake failed:', err)
                 })
               }
-            } else if (state === 'fail' || state === 'closed') {
+            } else if (
+              // SDK terminal states. The official name is `'failed'` (not
+              // `'fail'`); `'closed'` and `'disconnected'` are also terminal
+              // for an AgentManager session.
+              state === 'failed' ||
+              state === 'closed' ||
+              state === 'disconnected'
+            ) {
               setStatus('error')
               setErrorMsg('Verbindung verloren.')
             }
@@ -166,13 +175,25 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       managerRef.current = manager
       await manager.connect()
 
-      if (micStream && manager.publishMicrophoneStream) {
-        try {
-          await manager.publishMicrophoneStream(micStream)
-        } catch (err) {
-          // Some agent variants don't support mic streaming — log + continue.
-          console.warn('publishMicrophoneStream failed:', err)
+      if (micStream) {
+        if (!manager.publishMicrophoneStream) {
+          // SDK variant without mic support — stop the captured tracks so the
+          // OS mic indicator doesn't lie about a live recording.
+          console.warn('publishMicrophoneStream not supported by this SDK')
+          micStream.getTracks().forEach((t) => t.stop())
+          micStreamRef.current = null
           setMicActive(false)
+        } else {
+          try {
+            await manager.publishMicrophoneStream(micStream)
+            // Publish succeeded — `micActive` may have been set true on capture,
+            // we leave it as-is.
+          } catch (err) {
+            console.warn('publishMicrophoneStream failed:', err)
+            micStream.getTracks().forEach((t) => t.stop())
+            micStreamRef.current = null
+            setMicActive(false)
+          }
         }
       }
     } catch (err) {
@@ -212,28 +233,46 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       setMicActive(false)
       return
     }
+    let stream
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch (err) {
+      console.warn('mic toggle: getUserMedia failed:', err)
+      return
+    }
+    if (!manager.publishMicrophoneStream) {
+      // SDK can't publish — don't pretend the mic is live.
+      console.warn('publishMicrophoneStream not supported by this SDK')
+      stream.getTracks().forEach((t) => t.stop())
+      return
+    }
+    try {
+      await manager.publishMicrophoneStream(stream)
       micStreamRef.current = stream
-      if (manager.publishMicrophoneStream) {
-        await manager.publishMicrophoneStream(stream)
-      }
       setMicActive(true)
     } catch (err) {
-      console.warn('mic toggle failed:', err)
+      console.warn('publishMicrophoneStream failed:', err)
+      stream.getTracks().forEach((t) => t.stop())
     }
   }
 
-  // Expose a programmatic send to the parent (text-chat fallback)
+  // Expose a programmatic send to the parent (text-chat fallback). When the
+  // manager isn't live (teardown, error, disconnect), signal `null` so the
+  // parent can drop the stale reference and fall back to /api/chat instead of
+  // calling into a dead SDK handle.
   useEffect(() => {
-    if (!onReady || !managerRef.current) return
-    onReady({
-      sendText: (text) => {
-        const m = managerRef.current
-        if (!m) return Promise.resolve()
-        return m.chat(text)
-      },
-    })
+    if (!onReady) return
+    if (managerRef.current && status === 'live') {
+      onReady({
+        sendText: (text) => {
+          const m = managerRef.current
+          if (!m) return Promise.resolve()
+          return m.chat(text)
+        },
+      })
+    } else {
+      onReady(null)
+    }
   }, [status, onReady])
 
   return (

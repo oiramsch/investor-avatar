@@ -96,6 +96,18 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
+# Tiny char-blacklist for SSE chunks. Regex-based `strip_markdown` is unsafe
+# on streamed chunks because Anthropic sends them in tiny pieces (`**`, `Wort`,
+# `**`) and emphasis spans get split across boundaries — the regex misses and
+# the markers reach the TTS. Since the system prompt explicitly forbids markdown,
+# stray characters here are residue, not real formatting, so we just drop them.
+_MD_CHUNK_CHARS = str.maketrans("", "", "*_`#")
+
+
+def strip_markdown_chunk(text: str) -> str:
+    return text.translate(_MD_CHUNK_CHARS)
+
+
 def did_headers() -> dict:
     encoded = base64.b64encode(f"{DID_API_KEY}:".encode()).decode()
     return {
@@ -311,15 +323,22 @@ def _extract_claim_token(messages: list) -> Optional[str]:
 async def _resolve_guest_for_request(messages: list, distinct_id: Optional[str]) -> Tuple[dict, bool]:
     """Resolve the guest for an incoming Custom-LLM request.
     Returns (guest_dict, is_first_turn). Side-effect: binds distinct_id →
-    notion_id in DISTINCT_STORE the first time we see a claim."""
+    notion_id in DISTINCT_STORE the first time we see a claim.
+
+    `is_first_turn` is true ONLY when we actually consumed a claim from
+    CLAIM_STORE this request. D-ID sends the full history on every call, so
+    the CLAIM marker will sit in `messages[0]` forever — we must not let its
+    presence alone trigger the greeting injection."""
     _purge_expired()
 
     claim = _extract_claim_token(messages)
     notion_id: Optional[str] = None
+    claim_consumed = False
 
     if claim:
         entry = CLAIM_STORE.pop(claim, None)
         if entry and entry.get("expires_at", 0) >= _now():
+            claim_consumed = True
             notion_id = entry.get("notion_id")
             if distinct_id and notion_id:
                 DISTINCT_STORE[distinct_id] = {
@@ -339,14 +358,18 @@ async def _resolve_guest_for_request(messages: list, distinct_id: Optional[str])
         except Exception:
             logger.exception("Failed to load Notion guest %s — falling back to anonymous", notion_id)
 
-    is_first_turn = claim is not None
-    return guest, is_first_turn
+    return guest, claim_consumed
 
 
-def _messages_for_anthropic(messages: list, drop_claim: bool) -> list:
+def _messages_for_anthropic(messages: list, inject_greeting: bool) -> list:
     """Convert D-ID's `{role, content, created_at}` messages into Anthropic
-    `{role, content}`. Drops the claim marker so it never reaches the model."""
+    `{role, content}`. CLAIM marker messages are ALWAYS dropped (D-ID sends
+    full history on every turn — Claude must never see the handshake). When
+    `inject_greeting` is true (first consumed claim) and the CLAIM was the
+    only user input so far, we append a benign opener so the model still
+    produces the greeting turn."""
     out = []
+    skipped_claim = False
     for msg in messages:
         role = (msg.get("role") or "").lower()
         if role not in ("user", "assistant"):
@@ -358,11 +381,15 @@ def _messages_for_anthropic(messages: list, drop_claim: bool) -> list:
             )
         else:
             text = raw_content or ""
-        if drop_claim and role == "user" and CLAIM_MARKER_RE.match(text or ""):
-            # Replace the silent handshake message with a benign opener so the
-            # model still produces the greeting turn.
-            text = "Bitte begrüße mich jetzt herzlich. Stell dich und das Event kurz vor."
+        if role == "user" and CLAIM_MARKER_RE.match(text or ""):
+            skipped_claim = True
+            continue
         out.append({"role": role, "content": text})
+
+    if inject_greeting and skipped_claim and not any(m["role"] == "user" for m in out):
+        out.append(
+            {"role": "user", "content": "Bitte begrüße mich jetzt herzlich. Stell dich und das Event kurz vor."}
+        )
     return out
 
 
@@ -470,7 +497,7 @@ async def custom_llm(
     stream = bool(body.get("stream", True))
 
     guest, is_first_turn = await _resolve_guest_for_request(messages, x_did_distinct_id)
-    anthropic_messages = _messages_for_anthropic(messages, drop_claim=is_first_turn)
+    anthropic_messages = _messages_for_anthropic(messages, inject_greeting=is_first_turn)
     if not anthropic_messages:
         anthropic_messages = [
             {"role": "user", "content": "Bitte begrüße mich jetzt herzlich. Stell dich und das Event kurz vor."}
@@ -542,7 +569,7 @@ async def _run_anthropic_with_tools(
 
     async with anthropic_client.messages.stream(**create_kwargs) as s:
         async for text in s.text_stream:
-            text = strip_markdown(text)
+            text = strip_markdown_chunk(text)
             if text:
                 yield _sse_chunk(chunk_id, content=text)
         final = await s.get_final_message()
@@ -551,10 +578,28 @@ async def _run_anthropic_with_tools(
         tool_block = next((b for b in final.content if b.type == "tool_use"), None)
         if tool_block and tool_block.name == "update_rsvp" and notion_id:
             inputs = tool_block.input or {}
+            rsvp_ok = False
             try:
-                await update_notion_rsvp(notion_id, inputs.get("zusage", ""), inputs.get("mitteilung"))
+                rsvp_ok = bool(
+                    await update_notion_rsvp(
+                        notion_id, inputs.get("zusage", ""), inputs.get("mitteilung")
+                    )
+                )
             except Exception:
                 logger.exception("update_notion_rsvp failed")
+                rsvp_ok = False
+
+            tool_result_block: dict = {
+                "type": "tool_result",
+                "tool_use_id": tool_block.id,
+                "content": (
+                    "RSVP wurde erfolgreich gespeichert."
+                    if rsvp_ok
+                    else "Fehler beim Speichern des RSVP. Bitte sag dem Gast, dass es gerade nicht klappt und wir es später erneut versuchen."
+                ),
+            }
+            if not rsvp_ok:
+                tool_result_block["is_error"] = True
 
             followup_messages = list(anthropic_messages)
             followup_messages.append(
@@ -563,13 +608,7 @@ async def _run_anthropic_with_tools(
             followup_messages.append(
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_block.id,
-                            "content": "RSVP wurde erfolgreich gespeichert.",
-                        }
-                    ],
+                    "content": [tool_result_block],
                 }
             )
             followup_kwargs = dict(create_kwargs)
@@ -577,7 +616,7 @@ async def _run_anthropic_with_tools(
 
             async with anthropic_client.messages.stream(**followup_kwargs) as s2:
                 async for text in s2.text_stream:
-                    text = strip_markdown(text)
+                    text = strip_markdown_chunk(text)
                     if text:
                         yield _sse_chunk(chunk_id, content=text)
 
@@ -635,19 +674,20 @@ async def chat(req: ChatRequest):
             )
             rsvp_result = inputs
 
+            tool_result_block: dict = {
+                "type": "tool_result",
+                "tool_use_id": tool_block.id,
+                "content": (
+                    "RSVP wurde erfolgreich gespeichert."
+                    if rsvp_updated
+                    else "Fehler beim Speichern des RSVP. Bitte sag dem Gast, dass es gerade nicht klappt und wir es später erneut versuchen."
+                ),
+            }
+            if not rsvp_updated:
+                tool_result_block["is_error"] = True
+
             messages.append({"role": "assistant", "content": content_blocks_to_dict(response.content)})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_block.id,
-                            "content": "RSVP wurde erfolgreich gespeichert.",
-                        }
-                    ],
-                }
-            )
+            messages.append({"role": "user", "content": [tool_result_block]})
             create_kwargs["messages"] = messages
             response2 = await anthropic_client.messages.create(**create_kwargs)
             for block in response2.content:
