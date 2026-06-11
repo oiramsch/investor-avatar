@@ -64,6 +64,13 @@ Felder der Datenbank „Einladungen":
 | `Ansprache` | text | Interne KI-Verhaltenshinweise (nie dem Gast angezeigt) |
 | `Kontext` | text | Persönlicher Hintergrund des Gastes |
 
+## iOS / Safari
+
+Auf iPhone/iPad startet das Avatar-Video **stumm** — Apple blockiert Autoplay
+mit Ton ohne vorherige Nutzergeste. Sobald die Verbindung steht, erscheint ein
+„Ton an"-Overlay über dem Video; ein Tap aktiviert die Audiowiedergabe. Auf
+Desktop-Browsern wirkt der Tap genauso, ist aber dort nicht zwingend nötig.
+
 ## Cloudflare Tunnel
 
 Damit Gäste von außen zugreifen können:
