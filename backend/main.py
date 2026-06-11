@@ -43,12 +43,15 @@ anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 
 def strip_markdown(text: str) -> str:
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'_(.+?)_', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'`(.+?)`', r'\1', text, flags=re.DOTALL)
+    # Inline emphasis is bounded to a single line so list items rendered as
+    # `* item` don't get merged across newlines (DOTALL chewed list bullets).
+    text = re.sub(r'\*\*([^\n*]+?)\*\*', r'\1', text)
+    text = re.sub(r'\*([^\n*]+?)\*', r'\1', text)
+    text = re.sub(r'__([^\n_]+?)__', r'\1', text)
+    text = re.sub(r'_([^\n_]+?)_', r'\1', text)
+    text = re.sub(r'`([^\n`]+?)`', r'\1', text)
     text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*(?:[-+*]|\d+\.)\s+', '', text, flags=re.MULTILINE)
     return text.strip()
 
 
@@ -203,7 +206,7 @@ RSVP_TOOL = {
 }
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Models ──────────────────────────────────────────────────────────────
 
 
 class ChatMessage(BaseModel):
@@ -225,7 +228,7 @@ class RsvpRequest(BaseModel):
     mitteilung: Optional[str] = None
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ──────────────────────────────────────────────────────────────
 
 
 @app.get("/health")
@@ -392,7 +395,7 @@ async def chat(req: ChatRequest):
         try:
             async with httpx.AsyncClient() as http_client:
                 did_resp = await http_client.post(
-                    f"{DID_BASE_URL}/talks/streams/{req.stream_id}/talks",
+                    f"{DID_BASE_URL}/talks/streams/{req.stream_id}",
                     headers=did_headers(),
                     json={
                         "script": {
@@ -405,10 +408,21 @@ async def chat(req: ChatRequest):
                     },
                     timeout=30,
                 )
-            if did_resp.status_code not in (200, 201):
+            if did_resp.status_code in (200, 201):
+                try:
+                    talk_id = did_resp.json().get("id")
+                except Exception:
+                    talk_id = None
+                logger.info(
+                    "D-ID /talks ok %s talk_id=%s stream=%s",
+                    did_resp.status_code,
+                    talk_id,
+                    req.stream_id,
+                )
+            else:
                 logger.error("D-ID /talks error %s: %s", did_resp.status_code, did_resp.text)
-        except Exception as exc:
-            logger.error("D-ID /talks request failed: %s", exc)
+        except Exception:
+            logger.exception("D-ID /talks request failed")
 
     return {"reply": reply_text, "rsvp_updated": rsvp_updated, "rsvp": rsvp_result}
 

@@ -1,13 +1,16 @@
 import { useState, useRef, useEffect } from 'react'
 
 function stripMarkdown(text) {
+  // Bounded to a single line so list items rendered as `* foo` don't get
+  // their content merged across newlines (the prior /gs variant did).
   return text
-    .replace(/\*\*(.+?)\*\*/gs, '$1')
-    .replace(/\*(.+?)\*/gs, '$1')
-    .replace(/__(.+?)__/gs, '$1')
-    .replace(/_(.+?)_/gs, '$1')
-    .replace(/`(.+?)`/gs, '$1')
+    .replace(/\*\*([^\n*]+?)\*\*/g, '$1')
+    .replace(/\*([^\n*]+?)\*/g, '$1')
+    .replace(/__([^\n_]+?)__/g, '$1')
+    .replace(/_([^\n_]+?)_/g, '$1')
+    .replace(/`([^\n`]+?)`/g, '$1')
     .replace(/^#+\s+/gm, '')
+    .replace(/^\s*(?:[-+*]|\d+\.)\s+/gm, '')
 }
 
 function Message({ role, content }) {
