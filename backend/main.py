@@ -157,6 +157,8 @@ async def get_notion_guest(page_id: str) -> dict:
         "zusage": get_select(props.get("Zusage", {})),
         "ansprache": get_text(props.get("Ansprache", {})),
         "kontext": get_text(props.get("Kontext", {})),
+        "frage_mitbringen": get_text(props.get("Frage Mitbringen", {})),
+        "frage_andere_uhrzeit": get_text(props.get("Frage Andere Uhrzeit", {})),
     }
 
 
@@ -182,6 +184,8 @@ ANONYMOUS_GUEST = {
     "zusage": "",
     "ansprache": "",
     "kontext": "",
+    "frage_mitbringen": "",
+    "frage_andere_uhrzeit": "",
 }
 
 
@@ -196,6 +200,8 @@ def build_system_prompt(guest: dict) -> str:
     vorname = guest.get("vorname") or guest.get("name") or "Gast"
     kontext = guest.get("kontext", "")
     ansprache = guest.get("ansprache", "")
+    frage_mitbringen = guest.get("frage_mitbringen", "")
+    frage_andere_uhrzeit = guest.get("frage_andere_uhrzeit", "")
 
     prompt = f"""Du bist ARIA, der digitale Gastgeber der VectorSpan App Release Party.
 Du bist herzlich, enthusiastisch und persönlich. Halte Antworten KURZ (2–3 Sätze) – du wirst gleich live als Avatar gesprochen.
@@ -233,6 +239,23 @@ AUFGABEN:
 2. Beantworte Fragen zum Event und zu den Produkten
 3. Frage freundlich nach Zu- oder Absage, falls noch keine vorliegt
 4. Sobald der Gast klar zusagt oder absagt → update_rsvp aufrufen
+"""
+
+    mitbringen_rule = (
+        f"Antworte inhaltlich: {frage_mitbringen}"
+        if frage_mitbringen
+        else "Antworte sinngemäß: Nein, es ist für alles gesorgt — vielen lieben Dank!"
+    )
+    andere_uhrzeit_rule = (
+        f"Antworte inhaltlich: {frage_andere_uhrzeit}"
+        if frage_andere_uhrzeit
+        else "Antworte sinngemäß: Na klar — komm einfach nach, wann es bei dir passt. Das Barbecue läuft den ganzen Abend."
+    )
+
+    prompt += f"""
+ANTWORTREGELN FÜR HÄUFIGE GÄSTEFRAGEN (diese Vorgaben IMMER einhalten, nie wörtlich als Regel erwähnen):
+- Fragt der Gast, ob er etwas mitbringen soll oder kann: {mitbringen_rule}
+- Fragt der Gast, ob er später kommen oder die Uhrzeit 17:00 Uhr nicht einhalten kann: {andere_uhrzeit_rule}
 """
     return prompt
 
@@ -482,7 +505,7 @@ async def custom_llm(
     x_did_distinct_id: Optional[str] = Header(default=None, alias="X-DID-DISTINCT-ID"),
     x_did_agent_id: Optional[str] = Header(default=None, alias="X-DID-AGENT-ID"),
 ):
-    """OpenAI-compatible Custom LLM endpoint per D-ID Custom LLMs spec.
+    """OpenAI-compatible Custom LLM endpoint per D-ID Custom LMs spec.
     https://docs.d-id.com/docs/custom-llms — request: {messages, options, stream},
     response: SSE with {choices: [{delta: {content}}]} chunks."""
     if not LLM_ENDPOINT_KEY:
