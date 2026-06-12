@@ -14,8 +14,11 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const srcObjectRef = useRef(null)
   const cancelledRef = useRef(false)
   const claimSentRef = useRef(false)
-  const recognitionRef = useRef(null)   // SpeechRecognition instance for PTT fallback
-  const pttActiveRef = useRef(false)    // true while PTT session is running
+  const recognitionRef = useRef(null)
+  const continuousActiveRef = useRef(false)  // continuous SR session is logically running
+  const isSpeakingRef = useRef(false)        // avatar is currently talking (anti-echo gate)
+  const speechRestartTimerRef = useRef(null) // setTimeout handle for post-speaking SR restart
+  const micMutedRef = useRef(false)          // mirrors micMuted state for use in callbacks
 
   const [sessionConfig, setSessionConfig] = useState(null)
   const [status, setStatus] = useState('idle') // idle | requesting | connecting | live | error | disabled
@@ -23,10 +26,11 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const [muted, setMuted] = useState(true)
   const [micActive, setMicActive] = useState(false)
   const [micError, setMicError] = useState('')
-  // null = unknown (pre-connect), true = LiveKit mic-publish, false = PTT fallback
+  // null = unknown (pre-connect), true = LiveKit mic-publish, false = SpeechRecognition mode
   const [sdkMicAvailable, setSdkMicAvailable] = useState(null)
   const [speechText, setSpeechText] = useState('')
-  const [pttDisabled, setPttDisabled] = useState(false)
+  const [speechBlocked, setSpeechBlocked] = useState(false) // terminal permission error
+  const [micMuted, setMicMuted] = useState(false)           // user silenced their own mic
 
   const isDebug = new URLSearchParams(window.location.search).get('debug') === '1'
   const [debug, setDebug] = useState({
@@ -42,6 +46,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     claimSent: false,
     claimTs: '',
     claimResult: '—',
+    speechState: '—',
     errors: [],
   })
 
@@ -99,8 +104,12 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   }, [notionId])
 
   const teardown = useCallback(() => {
-    pttActiveRef.current = false
-    setPttDisabled(false)
+    continuousActiveRef.current = false
+    micMutedRef.current = false
+    isSpeakingRef.current = false
+    clearTimeout(speechRestartTimerRef.current)
+    setSpeechBlocked(false)
+    setMicMuted(false)
     const rec = recognitionRef.current
     recognitionRef.current = null
     try { rec?.abort() } catch {}
@@ -117,12 +126,23 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     }
   }, [])
 
-  // 2) User-initiated connect (gesture required for iOS audio + mic)
+  // 2) User-initiated connect — one tap does everything
   const handleStart = async () => {
     if (!sessionConfig || status === 'connecting' || status === 'live') return
+
+    // Unmute video synchronously in the gesture context so iOS Safari allows
+    // unmuted autoplay when the stream arrives later (no async gap on the element).
+    const v = videoRef.current
+    if (v) {
+      v.muted = false
+      v.play().catch(() => {}) // no src yet; this "blesses" the element on iOS
+    }
+
     setStatus('requesting')
     setErrorMsg('')
     setMicError('')
+    setMicMuted(false)
+    micMutedRef.current = false
 
     if (isDebug) {
       try {
@@ -163,18 +183,26 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         streamOptions: {
           compatibilityMode: 'auto',
           streamWarmup: true,
-          outputResolution: 512, // cap resolution for v1 (WebRTC) streams; ignored on LiveKit
+          outputResolution: 512,
         },
         callbacks: {
           onSrcObjectReady(srcObject) {
             srcObjectRef.current = srcObject
             const v = videoRef.current
             if (!v) return
-            // Start with the live WebRTC stream; onVideoStateChange will switch to
-            // idle_video once the warmup/talking stream stops.
+            // Switch to live WebRTC stream; v.muted was already set false in
+            // the gesture context so unmuted play should be allowed.
             v.src = ''
             v.srcObject = srcObject
-            v.play().catch((e) => console.warn('video.play() failed:', e))
+            v.play()
+              .then(() => setMuted(false))
+              .catch((e) => {
+                // Unmuted autoplay blocked — fall back to muted + show "Ton an" overlay
+                console.warn('video.play() with audio failed, falling back to muted:', e)
+                v.muted = true
+                setMuted(true)
+                v.play().catch(() => {})
+              })
             if (isDebug) updateVideoDebug()
           },
 
@@ -182,14 +210,34 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             const v = videoRef.current
             if (!v) return
             if (state === 'STOP') {
-              // Agent finished talking => show pre-rendered idle video
+              isSpeakingRef.current = false
+              // Resume SpeechRecognition after a brief echo-fade delay
+              clearTimeout(speechRestartTimerRef.current)
+              if (continuousActiveRef.current && !micMutedRef.current) {
+                speechRestartTimerRef.current = setTimeout(() => {
+                  const rec = recognitionRef.current
+                  if (continuousActiveRef.current && !micMutedRef.current && rec) {
+                    try { rec.start() } catch {}
+                  }
+                  if (isDebug) setDebug((prev) => ({ ...prev, speechState: 'listening' }))
+                }, 400)
+              }
+              // Switch to pre-rendered idle video
               const idleUrl = managerRef.current?.agent?.presenter?.idle_video
               v.srcObject = null
               v.loop = true
               v.src = idleUrl || ''
               if (idleUrl) v.play().catch(() => {})
             } else {
-              // state === 'START' -- agent is talking => switch to live WebRTC stream
+              // START — avatar is talking
+              isSpeakingRef.current = true
+              clearTimeout(speechRestartTimerRef.current)
+              // Pause SpeechRecognition to prevent the avatar's voice being transcribed
+              const rec = recognitionRef.current
+              if (rec) { try { rec.abort() } catch {} }
+              if (isDebug) setDebug((prev) => ({ ...prev, speechState: 'paused-while-speaking' }))
+
+              // Switch to live WebRTC stream
               v.loop = false
               v.src = ''
               v.srcObject = srcObjectRef.current
@@ -212,7 +260,6 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             if (state === 'connected') {
               setStatus('live')
             } else if (
-              // SDK uses 'fail', NOT 'failed'
               state === 'fail' ||
               state === 'closed' ||
               state === 'disconnected'
@@ -261,9 +308,6 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       managerRef.current = manager
       await manager.connect()
 
-      // Send CLAIM/greeting AFTER connect() resolves -- calling chat() inside the
-      // onConnectionStateChange callback (while connect() is still executing) can
-      // silently fail because the internal chat session isn't fully ready yet.
       if (sessionConfig.claim_marker && !claimSentRef.current) {
         claimSentRef.current = true
         const ts = new Date().toISOString()
@@ -283,16 +327,9 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         )
       }
 
-      // Publish mic after connect.
-      // publishMicrophoneStream is only available when the agent uses an Expressive presenter
-      // (presenter.type === "expressive"), which selects the LiveKit (v2) streaming manager.
-      // Talk/Clip presenters use the WebRTC (v1) manager that lacks publishMicrophoneStream.
-      // SDK source: node_modules/@d-id/client-sdk/dist/index.umd.cjs, function Tu(n,e):
-      //   ir(n.presenter.type) ? {version:"v2",...bu()} : {version:"v1",...ku(e)}
-      //   where ir = n => n === "expressive"
       const isLiveKit = manager.getStreamType?.() === 'livekit'
       setSdkMicAvailable(isLiveKit)
-      if (isDebug) setDebug((prev) => ({ ...prev, micPublish: isLiveKit ? 'livekit-checking...' : 'ptt-ready' }))
+      if (isDebug) setDebug((prev) => ({ ...prev, micPublish: isLiveKit ? 'livekit-checking...' : 'sr-continuous' }))
 
       if (micStream) {
         if (isLiveKit) {
@@ -312,12 +349,17 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             }
           }
         } else {
-          // Non-LiveKit: release getUserMedia stream so SpeechRecognition can claim the mic on demand
+          // Release getUserMedia stream so SpeechRecognition can claim the mic
           micStream.getTracks().forEach((t) => t.stop())
           micStreamRef.current = null
           setMicActive(false)
-          if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'ptt-ready' }))
+          if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'sr-ready' }))
+          // Auto-start continuous speech recognition (Daueraufnahme)
+          startContinuousListening()
         }
+      } else if (!isLiveKit) {
+        // getUserMedia was denied but SpeechRecognition may still work
+        startContinuousListening()
       }
     } catch (err) {
       console.error('D-ID Agents setup failed:', err)
@@ -333,35 +375,127 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     }
   }
 
-  const handleUnmute = () => {
-    const v = videoRef.current
-    if (!v) return
-    v.muted = false
-    setMuted(false)
-    v.play().catch((e) => console.warn('unmute play() failed:', e))
-  }
+  // Continuous SpeechRecognition with anti-echo support.
+  // Uses continuous:false + onend-restart for iOS Safari compatibility.
+  const startContinuousListening = useCallback(() => {
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRec) {
+      setMicError('Spracheingabe nicht verfügbar.')
+      if (isDebug) setDebug((prev) => ({ ...prev, speechState: 'unavailable' }))
+      return
+    }
+    const lang = speechLang(sessionConfig?.guest?.sprache)
+    const rec = new SpeechRec()
+    rec.continuous = false  // iOS Safari requires onend-restart pattern
+    rec.interimResults = true
+    rec.lang = lang
 
+    rec.onresult = (event) => {
+      // Anti-echo: discard transcripts that arrive while avatar is speaking
+      if (isSpeakingRef.current) return
+
+      let interim = ''
+      let final = ''
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript
+        if (event.results[i].isFinal) final += t
+        else interim += t
+      }
+      setSpeechText(interim || final)
+      if (final.trim()) {
+        setSpeechText('')
+        managerRef.current?.chat(final.trim())?.catch((err) => {
+          console.warn('speech chat failed:', err)
+        })
+      }
+    }
+
+    rec.onerror = (event) => {
+      if (event.error === 'no-speech' || event.error === 'aborted') return
+      console.warn('SpeechRecognition error:', event.error)
+      const isTerminal = event.error === 'not-allowed' || event.error === 'service-not-available'
+      if (isTerminal) {
+        continuousActiveRef.current = false
+        recognitionRef.current = null
+        setMicActive(false)
+        setSpeechBlocked(true)
+        setMicError('Spracheingabe nicht erlaubt – Mikrofonberechtigung im Browser prüfen.')
+        if (isDebug) {
+          setDebug((prev) => ({ ...prev, speechState: 'blocked' }))
+          pushDebugError(`speech: ${event.error}`)
+        }
+      } else {
+        setMicError(`Sprache: ${event.error}`)
+      }
+    }
+
+    // Auto-restart after each utterance for continuous mode.
+    // Skip restart if: user muted, avatar is speaking (let the timer handle it), or session ended.
+    rec.onend = () => {
+      if (
+        continuousActiveRef.current &&
+        recognitionRef.current === rec &&
+        !micMutedRef.current &&
+        !isSpeakingRef.current
+      ) {
+        try { rec.start() } catch { /* stopped externally */ }
+      }
+    }
+
+    recognitionRef.current = rec
+    continuousActiveRef.current = true
+    try {
+      rec.start()
+      setMicActive(true)
+      setMicError('')
+      if (isDebug) setDebug((prev) => ({ ...prev, speechState: 'listening' }))
+    } catch (err) {
+      console.warn('SpeechRecognition start failed:', err)
+      continuousActiveRef.current = false
+      recognitionRef.current = null
+      setMicError(`Sprache: ${err.message}`)
+      if (isDebug) setDebug((prev) => ({ ...prev, speechState: 'error' }))
+    }
+  }, [sessionConfig, isDebug, pushDebugError])
+
+  // Toggle button: mute/unmute mic (SpeechRecognition) or publish/unpublish (LiveKit)
   const toggleMic = async () => {
     const manager = managerRef.current
     if (!manager) return
 
-    // Push-to-Talk fallback (non-LiveKit / non-Expressive agent)
+    // Non-LiveKit: mute/unmute continuous SpeechRecognition
     if (sdkMicAvailable === false) {
-      if (pttDisabled) return
-      if (micActive) {
-        pttActiveRef.current = false
+      if (speechBlocked) return
+
+      if (micMuted || !micActive) {
+        // Un-mute: resume listening
+        micMutedRef.current = false
+        setMicMuted(false)
+        setMicActive(true)
+        setMicError('')
+        clearTimeout(speechRestartTimerRef.current)
         const rec = recognitionRef.current
-        recognitionRef.current = null
-        try { rec?.abort() } catch {}
-        setSpeechText('')
-        setMicActive(false)
+        if (continuousActiveRef.current && rec && !isSpeakingRef.current) {
+          try { rec.start() } catch {}
+        } else if (!continuousActiveRef.current) {
+          startContinuousListening()
+        }
+        if (isDebug) setDebug((prev) => ({ ...prev, speechState: 'listening' }))
       } else {
-        startPTT()
+        // Mute: pause recognition while keeping the session logically active
+        micMutedRef.current = true
+        setMicMuted(true)
+        setMicActive(false)
+        clearTimeout(speechRestartTimerRef.current)
+        const rec = recognitionRef.current
+        if (rec) { try { rec.abort() } catch {} }
+        setSpeechText('')
+        if (isDebug) setDebug((prev) => ({ ...prev, speechState: 'muted' }))
       }
       return
     }
 
-    // SDK mic mode (LiveKit / Expressive agent)
+    // LiveKit mode: publish/unpublish mic stream
     if (micActive) {
       if (manager.unpublishMicrophoneStream) {
         await manager.unpublishMicrophoneStream().catch(() => {})
@@ -404,71 +538,6 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     }
   }
 
-  const startPTT = useCallback(() => {
-    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SpeechRec) {
-      setMicError('Spracheingabe nicht verfügbar.')
-      return
-    }
-    const lang = speechLang(sessionConfig?.guest?.sprache)
-    const rec = new SpeechRec()
-    rec.continuous = false
-    rec.interimResults = true
-    rec.lang = lang
-
-    rec.onresult = (event) => {
-      let interim = ''
-      let final = ''
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const t = event.results[i][0].transcript
-        if (event.results[i].isFinal) final += t
-        else interim += t
-      }
-      setSpeechText(interim || final)
-      if (final.trim()) {
-        setSpeechText('')
-        managerRef.current?.chat(final.trim())?.catch((err) => {
-          console.warn('PTT chat failed:', err)
-        })
-      }
-    }
-
-    rec.onerror = (event) => {
-      if (event.error === 'no-speech' || event.error === 'aborted') return
-      console.warn('SpeechRecognition error:', event.error)
-      const isTerminal = event.error === 'not-allowed' || event.error === 'service-not-available'
-      if (isTerminal) {
-        pttActiveRef.current = false
-        recognitionRef.current = null
-        setMicActive(false)
-        setPttDisabled(true)
-        setMicError('Spracheingabe nicht erlaubt – Mikrofonberechtigung im Browser prüfen.')
-      } else {
-        setMicError(`PTT: ${event.error}`)
-      }
-    }
-
-    // Auto-restart after each utterance so the session stays live
-    rec.onend = () => {
-      if (pttActiveRef.current && recognitionRef.current === rec) {
-        try { rec.start() } catch { /* stopped externally */ }
-      }
-    }
-
-    recognitionRef.current = rec
-    pttActiveRef.current = true
-    try {
-      rec.start()
-      setMicActive(true)
-      setMicError('')
-    } catch (err) {
-      console.warn('SpeechRecognition start failed:', err)
-      pttActiveRef.current = false
-      recognitionRef.current = null
-      setMicError(`PTT: ${err.message}`)
-    }
-  }, [sessionConfig])
-
   // Expose programmatic send to parent
   useEffect(() => {
     if (!onReady) return
@@ -494,7 +563,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
 
   return (
     <div className="relative w-full max-w-xs aspect-[3/4] rounded-2xl overflow-hidden shadow-2xl bg-gray-800 ring-1 ring-gray-700/50">
-      {/* Video -- always in DOM; idle_video shows via src, live stream via srcObject */}
+      {/* Video — always in DOM; idle_video via src, live stream via srcObject */}
       <video
         ref={videoRef}
         autoPlay
@@ -505,7 +574,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         }`}
       />
 
-      {/* Idle (waiting for session config or for user to tap) */}
+      {/* Idle (waiting for session config or user tap) */}
       {(status === 'idle' || status === 'requesting') && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-gradient-to-b from-gray-800 to-gray-900 p-4">
           <div className="w-20 h-20 rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-3xl font-bold shadow-lg">
@@ -522,13 +591,13 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3zM19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8" />
             </svg>
-            {status === 'requesting' ? 'Mikrofon...' : 'Gespräch starten'}
+            {status === 'requesting' ? 'Verbinde ...' : 'Gespräch starten'}
           </button>
           {micError && (
             <p className="text-[10px] text-red-400 text-center max-w-[200px] leading-snug">{micError}</p>
           )}
           <p className="text-[10px] text-gray-600 text-center max-w-[200px] leading-snug">
-            Tippe, um Mikrofon und Audio zu erlauben.
+            Ein Tap — Ton, Mikrofon und Gespräch starten.
           </p>
         </div>
       )}
@@ -569,11 +638,17 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         </div>
       )}
 
-      {/* Unmute overlay -- iOS Safari only autoplays muted */}
+      {/* Unmute overlay — only shown as fallback when unmuted autoplay was blocked */}
       {status === 'live' && muted && (
         <button
           type="button"
-          onClick={handleUnmute}
+          onClick={() => {
+            const v = videoRef.current
+            if (!v) return
+            v.muted = false
+            setMuted(false)
+            v.play().catch((e) => console.warn('unmute play() failed:', e))
+          }}
           className="absolute inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[2px] hover:bg-black/40 transition-colors"
           aria-label="Ton einschalten"
         >
@@ -597,37 +672,41 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             <button
               type="button"
               onClick={toggleMic}
-              disabled={sdkMicAvailable === false && pttDisabled}
+              disabled={speechBlocked}
               title={micError || undefined}
               className={`flex items-center gap-1.5 px-3 py-1 rounded-full backdrop-blur-sm text-xs transition-colors ${
-                micActive
-                  ? 'bg-emerald-500/30 text-emerald-300 ring-1 ring-emerald-500/40'
-                  : (micError || pttDisabled)
-                    ? 'bg-red-500/20 text-red-400 ring-1 ring-red-500/30 opacity-60 cursor-not-allowed'
-                    : 'bg-black/50 text-gray-400 hover:bg-black/70'
+                speechBlocked
+                  ? 'bg-red-500/20 text-red-400 ring-1 ring-red-500/30 opacity-60 cursor-not-allowed'
+                  : micActive && !micMuted
+                    ? 'bg-emerald-500/30 text-emerald-300 ring-1 ring-emerald-500/40'
+                    : micMuted
+                      ? 'bg-gray-600/40 text-gray-300 ring-1 ring-gray-500/30 hover:bg-gray-600/60'
+                      : 'bg-black/50 text-gray-400 hover:bg-black/70'
               }`}
               aria-label={
-                sdkMicAvailable === false
-                  ? pttDisabled
-                    ? 'Spracheingabe gesperrt'
-                    : micActive ? 'PTT deaktivieren' : 'PTT aktivieren'
-                  : micActive ? 'Mikrofon stumm schalten' : 'Mikrofon aktivieren'
+                speechBlocked
+                  ? 'Spracheingabe gesperrt'
+                  : micActive && !micMuted
+                    ? 'Mikrofon stummschalten'
+                    : 'Mikrofon aktivieren'
               }
             >
               <svg xmlns="http://www.w3.org/2000/svg" className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3zM19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8" />
               </svg>
-              {sdkMicAvailable === false
-                ? pttDisabled ? 'PTT gesperrt' : (micActive ? 'PTT an' : 'PTT')
-                : (micActive ? 'Mic an' : 'Mic aus')}
+              {speechBlocked
+                ? 'Gesperrt'
+                : micActive && !micMuted
+                  ? 'Hört zu'
+                  : 'Stumm'}
             </button>
           </div>
-          {sdkMicAvailable === false && pttDisabled && (
+          {speechBlocked && (
             <p className="text-[9px] text-red-400/90 bg-black/60 px-2 py-0.5 rounded-full max-w-[220px] text-center leading-snug">
               Spracheingabe gesperrt – Berechtigung prüfen
             </p>
           )}
-          {sdkMicAvailable === false && !pttDisabled && speechText && (
+          {!speechBlocked && speechText && (
             <p className="text-[9px] text-gray-300/90 bg-black/60 px-2 py-0.5 rounded-full max-w-[200px] truncate italic">
               {speechText}
             </p>
@@ -635,7 +714,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         </div>
       )}
 
-      {/* Debug overlay -- only visible with ?debug=1 */}
+      {/* Debug overlay — only visible with ?debug=1 */}
       {isDebug && (status === 'connecting' || status === 'live' || status === 'error') && (
         <div className="absolute top-2 left-2 right-2 bg-black/75 text-[9px] font-mono text-green-300 p-2 rounded-lg leading-[1.4] pointer-events-none select-none z-50">
           <div>conn: <span className="text-white">{debug.connState}</span></div>
@@ -647,6 +726,16 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             a=<span className="text-white">{debug.audioTracks}</span>
           </div>
           <div>mic: perm=<span className="text-white">{debug.micPermission}</span> pub=<span className="text-white">{debug.micPublish}</span></div>
+          <div>
+            speech:{' '}
+            <span className={
+              debug.speechState === 'listening' ? 'text-emerald-400' :
+              debug.speechState === 'paused-while-speaking' ? 'text-yellow-400' :
+              debug.speechState === 'muted' ? 'text-gray-400' :
+              debug.speechState === 'blocked' ? 'text-red-400' :
+              'text-white'
+            }>{debug.speechState}</span>
+          </div>
           <div>
             claim:{' '}
             {debug.claimSent
