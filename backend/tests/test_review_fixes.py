@@ -90,6 +90,7 @@ def test_is_first_turn_only_true_when_claim_consumed(monkeypatch):
 
     main.CLAIM_STORE.clear()
     main.DISTINCT_STORE.clear()
+    main.CLAIM_RESOLVED_STORE.clear()
     main.CLAIM_STORE["ctx_test12345678"] = {
         "notion_id": None,
         "expires_at": main._now() + 60,
@@ -104,6 +105,58 @@ def test_is_first_turn_only_true_when_claim_consumed(monkeypatch):
     # must NOT be treated as first turn anymore.
     guest2, first2 = asyncio.run(main._resolve_guest_for_request(msgs, "distinct_1"))
     assert first2 is False
+
+
+def test_personalization_persists_after_first_turn(monkeypatch):
+    """Bug fix: subsequent turns must resolve the same guest, not ANONYMOUS_GUEST.
+    D-ID sends full history on every call; the CLAIM marker stays in messages[0]
+    after consumption. CLAIM_RESOLVED_STORE provides the lookup for turns 2+."""
+    import asyncio
+
+    fake_guest = {
+        "id": "page_mario",
+        "name": "Schmelzer",
+        "vorname": "Mario",
+        "sprache": "Deutsch",
+        "zusage": "",
+        "ansprache": "",
+        "kontext": "",
+        "frage_mitbringen": "",
+        "frage_andere_uhrzeit": "",
+    }
+
+    main.CLAIM_STORE.clear()
+    main.DISTINCT_STORE.clear()
+    main.CLAIM_RESOLVED_STORE.clear()
+    main.CLAIM_STORE["ctx_persist_test1234"] = {
+        "notion_id": "page_mario",
+        "expires_at": main._now() + 60,
+    }
+
+    # Patch Notion call so we don't hit the network
+    async def fake_get_notion_guest(page_id):
+        return fake_guest
+
+    monkeypatch.setattr(main, "get_notion_guest", fake_get_notion_guest)
+
+    msgs = [
+        {"role": "user", "content": "CLAIM:ctx_persist_test1234"},
+        {"role": "assistant", "content": "Hallo Mario!"},
+        {"role": "user", "content": "Wie lange geht die Party?"},
+    ]
+
+    # Turn 1: claim consumed, guest resolved
+    guest1, first1 = asyncio.run(main._resolve_guest_for_request(msgs, None))
+    assert first1 is True
+    assert guest1["vorname"] == "Mario"
+
+    # Turn 2: same messages (full history), no distinct_id
+    # Before fix: falls back to ANONYMOUS_GUEST. After fix: still "Mario".
+    guest2, first2 = asyncio.run(main._resolve_guest_for_request(msgs, None))
+    assert first2 is False
+    assert guest2["vorname"] == "Mario", (
+        f"Expected 'Mario' on turn 2 but got '{guest2['vorname']}' — personalization lost!"
+    )
 
 
 def test_is_first_turn_false_when_no_claim():

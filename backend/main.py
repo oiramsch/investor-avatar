@@ -69,6 +69,10 @@ anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 CLAIM_STORE: dict[str, dict] = {}
 DISTINCT_STORE: dict[str, dict] = {}
+# Resolved claims: claim_token → {notion_id, expires_at}. D-ID sends full message
+# history on every call, so the CLAIM marker stays in messages[0] after the first
+# turn. We keep the resolved mapping here so subsequent turns still find the guest.
+CLAIM_RESOLVED_STORE: dict[str, dict] = {}
 
 
 def _now() -> float:
@@ -77,7 +81,7 @@ def _now() -> float:
 
 def _purge_expired() -> None:
     now = _now()
-    for store in (CLAIM_STORE, DISTINCT_STORE):
+    for store in (CLAIM_STORE, DISTINCT_STORE, CLAIM_RESOLVED_STORE):
         expired = [k for k, v in store.items() if v.get("expires_at", 0) < now]
         for k in expired:
             store.pop(k, None)
@@ -176,6 +180,35 @@ async def update_notion_rsvp(page_id: str, zusage: str, mitteilung: Optional[str
     return r.status_code == 200
 
 
+async def append_notion_mitteilung(page_id: str, text: str) -> bool:
+    """Append `text` to the Mitteilung field (never overwrites).
+    Format: "[TT.MM. HH:MM] text\n..." (UTC timestamps)."""
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=notion_headers(),
+            timeout=10,
+        )
+    if r.status_code != 200:
+        return False
+    props = r.json().get("properties", {})
+    existing = "".join(
+        t.get("plain_text", "")
+        for t in props.get("Mitteilung", {}).get("rich_text", [])
+    )
+    timestamp = time.strftime("[%d.%m. %H:%M]", time.gmtime())
+    entry = f"{timestamp} {text}"
+    new_text = f"{existing}\n{entry}".strip() if existing else entry
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=notion_headers(),
+            json={"properties": {"Mitteilung": {"rich_text": [{"text": {"content": new_text}}]}}},
+            timeout=10,
+        )
+    return r.status_code == 200
+
+
 ANONYMOUS_GUEST = {
     "id": None,
     "name": "Gast",
@@ -239,6 +272,7 @@ AUFGABEN:
 2. Beantworte Fragen zum Event und zu den Produkten
 3. Frage freundlich nach Zu- oder Absage, falls noch keine vorliegt
 4. Sobald der Gast klar zusagt oder absagt → update_rsvp aufrufen
+5. Biete aktiv an, eine kurze Nachricht für Mario zu hinterlassen (leave_message aufrufen). Bestätige nur wenn das Tool erfolgreich war; bei Fehler keine falsche Bestätigung.
 """
 
     mitbringen_rule = (
@@ -289,6 +323,21 @@ RSVP_TOOL = {
             },
         },
         "required": ["zusage"],
+    },
+}
+
+LEAVE_MESSAGE_TOOL = {
+    "name": "leave_message",
+    "description": "Hinterlässt eine persönliche Mitteilung des Gastes für Mario. Nur aufrufen, wenn der Gast explizit eine Nachricht hinterlassen möchte.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "nachricht": {
+                "type": "string",
+                "description": "Die Mitteilung des Gastes für Mario.",
+            }
+        },
+        "required": ["nachricht"],
     },
 }
 
@@ -345,13 +394,17 @@ def _extract_claim_token(messages: list) -> Optional[str]:
 
 async def _resolve_guest_for_request(messages: list, distinct_id: Optional[str]) -> Tuple[dict, bool]:
     """Resolve the guest for an incoming Custom-LLM request.
-    Returns (guest_dict, is_first_turn). Side-effect: binds distinct_id →
-    notion_id in DISTINCT_STORE the first time we see a claim.
+    Returns (guest_dict, is_first_turn). Side-effects: on first consumption
+    populates CLAIM_RESOLVED_STORE (claim→notion_id, long TTL) and DISTINCT_STORE.
 
     `is_first_turn` is true ONLY when we actually consumed a claim from
     CLAIM_STORE this request. D-ID sends the full history on every call, so
     the CLAIM marker will sit in `messages[0]` forever — we must not let its
-    presence alone trigger the greeting injection."""
+    presence alone trigger the greeting injection.
+
+    Personalization on turns 2+: CLAIM marker is still in the history but
+    CLAIM_STORE entry is already consumed. We look up CLAIM_RESOLVED_STORE
+    first (works when X-DID-DISTINCT-ID is absent), then DISTINCT_STORE."""
     _purge_expired()
 
     claim = _extract_claim_token(messages)
@@ -363,11 +416,23 @@ async def _resolve_guest_for_request(messages: list, distinct_id: Optional[str])
         if entry and entry.get("expires_at", 0) >= _now():
             claim_consumed = True
             notion_id = entry.get("notion_id")
+            if notion_id:
+                # Persist for subsequent turns — D-ID includes full history each call
+                CLAIM_RESOLVED_STORE[claim] = {
+                    "notion_id": notion_id,
+                    "expires_at": _now() + DISTINCT_TTL_SECONDS,
+                }
             if distinct_id and notion_id:
                 DISTINCT_STORE[distinct_id] = {
                     "notion_id": notion_id,
                     "expires_at": _now() + DISTINCT_TTL_SECONDS,
                 }
+
+    # Subsequent turns: claim present in history but already consumed from CLAIM_STORE
+    if not notion_id and claim:
+        entry = CLAIM_RESOLVED_STORE.get(claim)
+        if entry and entry.get("expires_at", 0) >= _now():
+            notion_id = entry.get("notion_id")
 
     if not notion_id and distinct_id:
         entry = DISTINCT_STORE.get(distinct_id)
@@ -528,7 +593,7 @@ async def custom_llm(
 
     system_prompt = build_system_prompt(guest)
     notion_id = guest.get("id")
-    tools = [RSVP_TOOL] if notion_id else []
+    tools = [RSVP_TOOL, LEAVE_MESSAGE_TOOL] if notion_id else []
 
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
@@ -578,8 +643,8 @@ async def _run_anthropic_with_tools(
     chunk_id: str,
 ):
     """Streams Claude text as OpenAI-compatible SSE chunks. If Claude calls
-    update_rsvp, we apply the Notion patch and replay the conversation with
-    the tool_result so the model produces the final spoken reply."""
+    update_rsvp or leave_message, we apply the Notion patch and replay the
+    conversation with the tool_result so the model produces the final spoken reply."""
 
     create_kwargs: dict[str, Any] = dict(
         model="claude-sonnet-4-6",
@@ -599,49 +664,67 @@ async def _run_anthropic_with_tools(
 
     if final.stop_reason == "tool_use":
         tool_block = next((b for b in final.content if b.type == "tool_use"), None)
-        if tool_block and tool_block.name == "update_rsvp" and notion_id:
+        if tool_block and notion_id:
             inputs = tool_block.input or {}
-            rsvp_ok = False
-            try:
-                rsvp_ok = bool(
-                    await update_notion_rsvp(
-                        notion_id, inputs.get("zusage", ""), inputs.get("mitteilung")
-                    )
-                )
-            except Exception:
-                logger.exception("update_notion_rsvp failed")
-                rsvp_ok = False
+            tool_result_content = ""
+            is_error = False
 
-            tool_result_block: dict = {
-                "type": "tool_result",
-                "tool_use_id": tool_block.id,
-                "content": (
+            if tool_block.name == "update_rsvp":
+                rsvp_ok = False
+                try:
+                    rsvp_ok = bool(
+                        await update_notion_rsvp(
+                            notion_id, inputs.get("zusage", ""), inputs.get("mitteilung")
+                        )
+                    )
+                except Exception:
+                    logger.exception("update_notion_rsvp failed")
+                tool_result_content = (
                     "RSVP wurde erfolgreich gespeichert."
                     if rsvp_ok
                     else "Fehler beim Speichern des RSVP. Bitte sag dem Gast, dass es gerade nicht klappt und wir es später erneut versuchen."
-                ),
-            }
-            if not rsvp_ok:
-                tool_result_block["is_error"] = True
+                )
+                if not rsvp_ok:
+                    is_error = True
 
-            followup_messages = list(anthropic_messages)
-            followup_messages.append(
-                {"role": "assistant", "content": content_blocks_to_dict(final.content)}
-            )
-            followup_messages.append(
-                {
-                    "role": "user",
-                    "content": [tool_result_block],
+            elif tool_block.name == "leave_message":
+                msg_ok = False
+                try:
+                    msg_ok = bool(
+                        await append_notion_mitteilung(notion_id, inputs.get("nachricht", ""))
+                    )
+                except Exception:
+                    logger.exception("append_notion_mitteilung failed")
+                tool_result_content = (
+                    "Mitteilung wurde erfolgreich für Mario hinterlassen."
+                    if msg_ok
+                    else "Fehler beim Speichern der Mitteilung. Bitte sag dem Gast, dass es gerade nicht klappt."
+                )
+                if not msg_ok:
+                    is_error = True
+
+            if tool_result_content:
+                tool_result_block: dict = {
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content": tool_result_content,
                 }
-            )
-            followup_kwargs = dict(create_kwargs)
-            followup_kwargs["messages"] = followup_messages
+                if is_error:
+                    tool_result_block["is_error"] = True
 
-            async with anthropic_client.messages.stream(**followup_kwargs) as s2:
-                async for text in s2.text_stream:
-                    text = strip_markdown_chunk(text)
-                    if text:
-                        yield _sse_chunk(chunk_id, content=text)
+                followup_messages = list(anthropic_messages)
+                followup_messages.append(
+                    {"role": "assistant", "content": content_blocks_to_dict(final.content)}
+                )
+                followup_messages.append({"role": "user", "content": [tool_result_block]})
+                followup_kwargs = dict(create_kwargs)
+                followup_kwargs["messages"] = followup_messages
+
+                async with anthropic_client.messages.stream(**followup_kwargs) as s2:
+                    async for text in s2.text_stream:
+                        text = strip_markdown_chunk(text)
+                        if text:
+                            yield _sse_chunk(chunk_id, content=text)
 
     yield _sse_chunk(chunk_id, finish_reason="stop")
 
@@ -671,7 +754,7 @@ async def chat(req: ChatRequest):
         messages = [{"role": m.role, "content": m.content} for m in req.history]
         messages.append({"role": "user", "content": req.message})
 
-    tools = [RSVP_TOOL] if req.notion_id else []
+    tools = [RSVP_TOOL, LEAVE_MESSAGE_TOOL] if req.notion_id else []
 
     create_kwargs: dict[str, Any] = dict(
         model="claude-sonnet-4-6",
@@ -690,32 +773,63 @@ async def chat(req: ChatRequest):
 
     if response.stop_reason == "tool_use":
         tool_block = next((b for b in response.content if b.type == "tool_use"), None)
-        if tool_block and tool_block.name == "update_rsvp" and req.notion_id:
-            inputs = tool_block.input
-            rsvp_updated = await update_notion_rsvp(
-                req.notion_id, inputs["zusage"], inputs.get("mitteilung")
-            )
-            rsvp_result = inputs
+        if tool_block and req.notion_id:
+            inputs = tool_block.input or {}
+            tool_result_content = ""
+            is_error = False
 
-            tool_result_block: dict = {
-                "type": "tool_result",
-                "tool_use_id": tool_block.id,
-                "content": (
+            if tool_block.name == "update_rsvp":
+                rsvp_updated = False
+                try:
+                    rsvp_updated = await update_notion_rsvp(
+                        req.notion_id, inputs.get("zusage", ""), inputs.get("mitteilung")
+                    )
+                except Exception:
+                    logger.exception("update_notion_rsvp failed (chat)")
+                rsvp_result = inputs
+                tool_result_content = (
                     "RSVP wurde erfolgreich gespeichert."
                     if rsvp_updated
                     else "Fehler beim Speichern des RSVP. Bitte sag dem Gast, dass es gerade nicht klappt und wir es später erneut versuchen."
-                ),
-            }
-            if not rsvp_updated:
-                tool_result_block["is_error"] = True
+                )
+                if not rsvp_updated:
+                    is_error = True
 
-            messages.append({"role": "assistant", "content": content_blocks_to_dict(response.content)})
-            messages.append({"role": "user", "content": [tool_result_block]})
-            create_kwargs["messages"] = messages
-            response2 = await anthropic_client.messages.create(**create_kwargs)
-            for block in response2.content:
-                if hasattr(block, "text"):
-                    reply_text += block.text
+            elif tool_block.name == "leave_message":
+                msg_ok = False
+                try:
+                    msg_ok = await append_notion_mitteilung(
+                        req.notion_id, inputs.get("nachricht", "")
+                    )
+                except Exception:
+                    logger.exception("append_notion_mitteilung failed (chat)")
+                tool_result_content = (
+                    "Mitteilung wurde erfolgreich für Mario hinterlassen."
+                    if msg_ok
+                    else "Fehler beim Speichern der Mitteilung. Bitte sag dem Gast, dass es gerade nicht klappt."
+                )
+                if not msg_ok:
+                    is_error = True
+
+            if tool_result_content:
+                tool_result_block: dict = {
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content": tool_result_content,
+                }
+                if is_error:
+                    tool_result_block["is_error"] = True
+                messages.append({"role": "assistant", "content": content_blocks_to_dict(response.content)})
+                messages.append({"role": "user", "content": [tool_result_block]})
+                create_kwargs["messages"] = messages
+                response2 = await anthropic_client.messages.create(**create_kwargs)
+                for block in response2.content:
+                    if hasattr(block, "text"):
+                        reply_text += block.text
+            else:
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        reply_text += block.text
         else:
             for block in response.content:
                 if hasattr(block, "text"):

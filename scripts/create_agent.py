@@ -118,7 +118,15 @@ def main() -> int:
     presenter_id = os.getenv("PRESENTER_ID", "noelle-c2nQB6Cy11").strip()
     driver_id = os.getenv("DRIVER_ID", "uM00QMwJ9x").strip()
     voice_id = os.getenv("VOICE_ID", "en-US-JennyMultilingualNeural").strip()
-    presenter_type = os.getenv("PRESENTER_TYPE", "expressive").strip()
+    presenter_type_raw = os.getenv("PRESENTER_TYPE", "expressive").strip()
+    presenter_type = presenter_type_raw.lower()
+    if presenter_type not in ("expressive", "clip", "talk"):
+        print(
+            f"ERROR: PRESENTER_TYPE='{presenter_type_raw}' is not supported. "
+            "Use one of: expressive, clip, talk.",
+            file=sys.stderr,
+        )
+        return 2
     allowed_domains = [
         d.strip() for d in os.getenv("ALLOWED_DOMAIN", "party.vectorspan.io").split(",") if d.strip()
     ]
@@ -132,8 +140,7 @@ def main() -> int:
         presenter = {"type": "expressive", "presenter_id": presenter_id, "voice": voice}
     elif presenter_type == "clip":
         presenter = {"type": "clip", "presenter_id": presenter_id, "driver_id": driver_id, "voice": voice}
-    else:
-        # "talk" (default legacy fallback) — WebRTC v1, no mic publish
+    else:  # "talk" — WebRTC v1, no mic publish
         presenter = {"type": "talk", "presenter_id": presenter_id, "driver_id": driver_id, "voice": voice}
 
     instructions = (
@@ -169,18 +176,60 @@ def main() -> int:
         "embed": True,
     }
 
+    env_agent_id = (os.getenv("DID_AGENT_ID") or "").strip()
+
     with httpx.Client(timeout=30) as client:
-        existing = _find_agent_by_name(client, headers, agent_name)
-        if existing:
-            agent_id = existing["id"]
-            print(f"→ updating existing agent {agent_id}")
+        # When DID_AGENT_ID is already in .env, trust it: fetch the agent
+        # directly. GET /agents reliably omits some agents we've created, so
+        # the name-based fallback below sometimes returns None on existing
+        # agents and the script then creates duplicates. The env id closes
+        # that hole.
+        agent_id: str | None = None
+        if env_agent_id:
+            existing = _get_agent_by_id(client, headers, env_agent_id)
+            if existing:
+                agent_id = existing["id"]
+                print(f"→ updating existing agent {agent_id} (from DID_AGENT_ID)")
+            else:
+                print(
+                    f"→ DID_AGENT_ID={env_agent_id} not found server-side; falling back to name lookup",
+                    file=sys.stderr,
+                )
+
+        if agent_id is None:
+            existing = _find_agent_by_name(client, headers, agent_name)
+            if existing:
+                agent_id = existing["id"]
+                print(f"→ updating existing agent {agent_id} (by name)")
+
+        if agent_id is not None:
             r = client.patch(f"https://api.d-id.com/agents/{agent_id}", headers=headers, json=body)
+            if r.status_code == 403:
+                # Most common cause: presenter type not in current plan
+                # (expressive requires a paid tier). We refuse to silently
+                # downgrade to a different presenter type — that's how we
+                # ended up with duplicate "talk" agents next to the real one.
+                print(
+                    f"ERROR: PATCH agent {agent_id} returned 403 — your D-ID plan may not include "
+                    f"presenter type '{presenter_type}'. Aborting without falling back.\n"
+                    f"Response: {r.text}",
+                    file=sys.stderr,
+                )
+                return 1
             if r.status_code not in (200, 204):
                 print(f"ERROR: update failed {r.status_code}: {r.text}", file=sys.stderr)
                 return 1
         else:
             print(f"→ creating new agent '{agent_name}'")
             r = client.post("https://api.d-id.com/agents", headers=headers, json=body)
+            if r.status_code == 403:
+                print(
+                    f"ERROR: POST /agents returned 403 — your D-ID plan may not include "
+                    f"presenter type '{presenter_type}'. Aborting without falling back to a different type.\n"
+                    f"Response: {r.text}",
+                    file=sys.stderr,
+                )
+                return 1
             if r.status_code not in (200, 201):
                 print(f"ERROR: create failed {r.status_code}: {r.text}", file=sys.stderr)
                 return 1
@@ -210,6 +259,25 @@ def main() -> int:
     print(f"LLM_ENDPOINT_KEY={llm_key}  # unchanged — D-ID stores it server-side")
     print()
     return 0
+
+
+def _get_agent_by_id(client: httpx.Client, headers: dict, agent_id: str) -> dict | None:
+    """Look up a known agent directly. Returns the agent dict if it exists,
+    None on 404. Raises on auth / network failures so we don't fall through
+    to a name lookup that could mint a duplicate."""
+    try:
+        r = client.get(f"https://api.d-id.com/agents/{agent_id}", headers=headers)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"agent lookup by id failed: {exc}") from exc
+    if r.status_code == 200:
+        data = r.json()
+        # API may return the agent flat or wrapped in {"agent": {...}}
+        return data.get("agent") if isinstance(data, dict) and "agent" in data else data
+    if r.status_code == 404:
+        return None
+    raise RuntimeError(
+        f"agent lookup by id returned {r.status_code}: {r.text} — refusing to fall through to create"
+    )
 
 
 def _find_agent_by_name(client: httpx.Client, headers: dict, name: str) -> dict | None:
