@@ -26,6 +26,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   // null = unknown (pre-connect), true = LiveKit mic-publish, false = PTT fallback
   const [sdkMicAvailable, setSdkMicAvailable] = useState(null)
   const [speechText, setSpeechText] = useState('')
+  const [pttDisabled, setPttDisabled] = useState(false)
 
   const isDebug = new URLSearchParams(window.location.search).get('debug') === '1'
   const [debug, setDebug] = useState({
@@ -99,6 +100,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
 
   const teardown = useCallback(() => {
     pttActiveRef.current = false
+    setPttDisabled(false)
     const rec = recognitionRef.current
     recognitionRef.current = null
     try { rec?.abort() } catch {}
@@ -345,6 +347,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
 
     // Push-to-Talk fallback (non-LiveKit / non-Expressive agent)
     if (sdkMicAvailable === false) {
+      if (pttDisabled) return
       if (micActive) {
         pttActiveRef.current = false
         const rec = recognitionRef.current
@@ -424,7 +427,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       setSpeechText(interim || final)
       if (final.trim()) {
         setSpeechText('')
-        managerRef.current?.chat(final.trim()).catch((err) => {
+        managerRef.current?.chat(final.trim())?.catch((err) => {
           console.warn('PTT chat failed:', err)
         })
       }
@@ -433,7 +436,16 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
     rec.onerror = (event) => {
       if (event.error === 'no-speech' || event.error === 'aborted') return
       console.warn('SpeechRecognition error:', event.error)
-      setMicError(`PTT: ${event.error}`)
+      const isTerminal = event.error === 'not-allowed' || event.error === 'service-not-available'
+      if (isTerminal) {
+        pttActiveRef.current = false
+        recognitionRef.current = null
+        setMicActive(false)
+        setPttDisabled(true)
+        setMicError('Spracheingabe nicht erlaubt – Mikrofonberechtigung im Browser prüfen.')
+      } else {
+        setMicError(`PTT: ${event.error}`)
+      }
     }
 
     // Auto-restart after each utterance so the session stays live
@@ -585,25 +597,37 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             <button
               type="button"
               onClick={toggleMic}
+              disabled={sdkMicAvailable === false && pttDisabled}
               title={micError || undefined}
               className={`flex items-center gap-1.5 px-3 py-1 rounded-full backdrop-blur-sm text-xs transition-colors ${
                 micActive
                   ? 'bg-emerald-500/30 text-emerald-300 ring-1 ring-emerald-500/40'
-                  : micError
-                    ? 'bg-red-500/20 text-red-400 ring-1 ring-red-500/30'
+                  : (micError || pttDisabled)
+                    ? 'bg-red-500/20 text-red-400 ring-1 ring-red-500/30 opacity-60 cursor-not-allowed'
                     : 'bg-black/50 text-gray-400 hover:bg-black/70'
               }`}
-              aria-label={micActive ? 'Mikrofon stumm schalten' : 'Mikrofon aktivieren'}
+              aria-label={
+                sdkMicAvailable === false
+                  ? pttDisabled
+                    ? 'Spracheingabe gesperrt'
+                    : micActive ? 'PTT deaktivieren' : 'PTT aktivieren'
+                  : micActive ? 'Mikrofon stumm schalten' : 'Mikrofon aktivieren'
+              }
             >
               <svg xmlns="http://www.w3.org/2000/svg" className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3zM19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8" />
               </svg>
               {sdkMicAvailable === false
-                ? (micActive ? 'PTT an' : 'PTT')
+                ? pttDisabled ? 'PTT gesperrt' : (micActive ? 'PTT an' : 'PTT')
                 : (micActive ? 'Mic an' : 'Mic aus')}
             </button>
           </div>
-          {sdkMicAvailable === false && speechText && (
+          {sdkMicAvailable === false && pttDisabled && (
+            <p className="text-[9px] text-red-400/90 bg-black/60 px-2 py-0.5 rounded-full max-w-[220px] text-center leading-snug">
+              Spracheingabe gesperrt – Berechtigung prüfen
+            </p>
+          )}
+          {sdkMicAvailable === false && !pttDisabled && speechText && (
             <p className="text-[9px] text-gray-300/90 bg-black/60 px-2 py-0.5 rounded-full max-w-[200px] truncate italic">
               {speechText}
             </p>
