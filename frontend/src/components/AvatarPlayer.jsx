@@ -3,6 +3,10 @@ import * as didSdk from '@d-id/client-sdk'
 
 const MAX_DEBUG_ERRORS = 5
 
+function speechLang(sprache) {
+  return { Deutsch: 'de-DE', Englisch: 'en-US', Französisch: 'fr-FR', Italienisch: 'it-IT' }[sprache] ?? 'de-DE'
+}
+
 export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const videoRef = useRef(null)
   const managerRef = useRef(null)
@@ -10,6 +14,8 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const srcObjectRef = useRef(null)
   const cancelledRef = useRef(false)
   const claimSentRef = useRef(false)
+  const recognitionRef = useRef(null)   // SpeechRecognition instance for PTT fallback
+  const pttActiveRef = useRef(false)    // true while PTT session is running
 
   const [sessionConfig, setSessionConfig] = useState(null)
   const [status, setStatus] = useState('idle') // idle | requesting | connecting | live | error | disabled
@@ -17,6 +23,9 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const [muted, setMuted] = useState(true)
   const [micActive, setMicActive] = useState(false)
   const [micError, setMicError] = useState('')
+  // null = unknown (pre-connect), true = LiveKit mic-publish, false = PTT fallback
+  const [sdkMicAvailable, setSdkMicAvailable] = useState(null)
+  const [speechText, setSpeechText] = useState('')
 
   const isDebug = new URLSearchParams(window.location.search).get('debug') === '1'
   const [debug, setDebug] = useState({
@@ -89,6 +98,12 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   }, [notionId])
 
   const teardown = useCallback(() => {
+    pttActiveRef.current = false
+    const rec = recognitionRef.current
+    recognitionRef.current = null
+    try { rec?.abort() } catch {}
+    setSpeechText('')
+
     if (micStreamRef.current) {
       micStreamRef.current.getTracks().forEach((t) => t.stop())
       micStreamRef.current = null
@@ -146,6 +161,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         streamOptions: {
           compatibilityMode: 'auto',
           streamWarmup: true,
+          outputResolution: 512, // cap resolution for v1 (WebRTC) streams; ignored on LiveKit
         },
         callbacks: {
           onSrcObjectReady(srcObject) {
@@ -265,16 +281,19 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
         )
       }
 
-      // Publish mic after connect
+      // Publish mic after connect.
+      // publishMicrophoneStream is only available when the agent uses an Expressive presenter
+      // (presenter.type === "expressive"), which selects the LiveKit (v2) streaming manager.
+      // Talk/Clip presenters use the WebRTC (v1) manager that lacks publishMicrophoneStream.
+      // SDK source: node_modules/@d-id/client-sdk/dist/index.umd.cjs, function Tu(n,e):
+      //   ir(n.presenter.type) ? {version:"v2",...bu()} : {version:"v1",...ku(e)}
+      //   where ir = n => n === "expressive"
+      const isLiveKit = manager.getStreamType?.() === 'livekit'
+      setSdkMicAvailable(isLiveKit)
+      if (isDebug) setDebug((prev) => ({ ...prev, micPublish: isLiveKit ? 'livekit-checking...' : 'ptt-ready' }))
+
       if (micStream) {
-        if (!manager.publishMicrophoneStream) {
-          // V2/V3 (non-Expressive) agents don't support mic streaming.
-          console.warn('publishMicrophoneStream not supported (V2/V3 agent)')
-          micStream.getTracks().forEach((t) => t.stop())
-          micStreamRef.current = null
-          setMicActive(false)
-          if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'not supported (V2/V3)' }))
-        } else {
+        if (isLiveKit) {
           try {
             await manager.publishMicrophoneStream(micStream)
             if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'ok' }))
@@ -284,11 +303,18 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
             micStream.getTracks().forEach((t) => t.stop())
             micStreamRef.current = null
             setMicActive(false)
+            setSdkMicAvailable(false)
             if (isDebug) {
               setDebug((prev) => ({ ...prev, micPublish: `error: ${err?.message}` }))
               pushDebugError(`publishMic: ${err?.message}`)
             }
           }
+        } else {
+          // Non-LiveKit: release getUserMedia stream so SpeechRecognition can claim the mic on demand
+          micStream.getTracks().forEach((t) => t.stop())
+          micStreamRef.current = null
+          setMicActive(false)
+          if (isDebug) setDebug((prev) => ({ ...prev, micPublish: 'ptt-ready' }))
         }
       }
     } catch (err) {
@@ -316,6 +342,23 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
   const toggleMic = async () => {
     const manager = managerRef.current
     if (!manager) return
+
+    // Push-to-Talk fallback (non-LiveKit / non-Expressive agent)
+    if (sdkMicAvailable === false) {
+      if (micActive) {
+        pttActiveRef.current = false
+        const rec = recognitionRef.current
+        recognitionRef.current = null
+        try { rec?.abort() } catch {}
+        setSpeechText('')
+        setMicActive(false)
+      } else {
+        startPTT()
+      }
+      return
+    }
+
+    // SDK mic mode (LiveKit / Expressive agent)
     if (micActive) {
       if (manager.unpublishMicrophoneStream) {
         await manager.unpublishMicrophoneStream().catch(() => {})
@@ -337,8 +380,7 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       if (isDebug) pushDebugError(`toggleMic getUserMedia: ${label}`)
       return
     }
-    if (!manager.publishMicrophoneStream) {
-      console.warn('publishMicrophoneStream not supported')
+    if (manager.getStreamType?.() !== 'livekit') {
       stream.getTracks().forEach((t) => t.stop())
       return
     }
@@ -358,6 +400,62 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
       }
     }
   }
+
+  const startPTT = useCallback(() => {
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRec) {
+      setMicError('Spracheingabe nicht verfügbar.')
+      return
+    }
+    const lang = speechLang(sessionConfig?.guest?.sprache)
+    const rec = new SpeechRec()
+    rec.continuous = false
+    rec.interimResults = true
+    rec.lang = lang
+
+    rec.onresult = (event) => {
+      let interim = ''
+      let final = ''
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript
+        if (event.results[i].isFinal) final += t
+        else interim += t
+      }
+      setSpeechText(interim || final)
+      if (final.trim()) {
+        setSpeechText('')
+        managerRef.current?.chat(final.trim()).catch((err) => {
+          console.warn('PTT chat failed:', err)
+        })
+      }
+    }
+
+    rec.onerror = (event) => {
+      if (event.error === 'no-speech' || event.error === 'aborted') return
+      console.warn('SpeechRecognition error:', event.error)
+      setMicError(`PTT: ${event.error}`)
+    }
+
+    // Auto-restart after each utterance so the session stays live
+    rec.onend = () => {
+      if (pttActiveRef.current && recognitionRef.current === rec) {
+        try { rec.start() } catch { /* stopped externally */ }
+      }
+    }
+
+    recognitionRef.current = rec
+    pttActiveRef.current = true
+    try {
+      rec.start()
+      setMicActive(true)
+      setMicError('')
+    } catch (err) {
+      console.warn('SpeechRecognition start failed:', err)
+      pttActiveRef.current = false
+      recognitionRef.current = null
+      setMicError(`PTT: ${err.message}`)
+    }
+  }, [sessionConfig])
 
   // Expose programmatic send to parent
   useEffect(() => {
@@ -478,29 +576,38 @@ export default function AvatarPlayer({ notionId, onMessage, onReady }) {
 
       {/* Status badges */}
       {status === 'live' && !muted && (
-        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-2">
-          <div className="flex items-center gap-1.5 bg-black/50 backdrop-blur-sm px-3 py-1 rounded-full">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-xs text-gray-300">Live</span>
+        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1">
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 bg-black/50 backdrop-blur-sm px-3 py-1 rounded-full">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="text-xs text-gray-300">Live</span>
+            </div>
+            <button
+              type="button"
+              onClick={toggleMic}
+              title={micError || undefined}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-full backdrop-blur-sm text-xs transition-colors ${
+                micActive
+                  ? 'bg-emerald-500/30 text-emerald-300 ring-1 ring-emerald-500/40'
+                  : micError
+                    ? 'bg-red-500/20 text-red-400 ring-1 ring-red-500/30'
+                    : 'bg-black/50 text-gray-400 hover:bg-black/70'
+              }`}
+              aria-label={micActive ? 'Mikrofon stumm schalten' : 'Mikrofon aktivieren'}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3zM19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8" />
+              </svg>
+              {sdkMicAvailable === false
+                ? (micActive ? 'PTT an' : 'PTT')
+                : (micActive ? 'Mic an' : 'Mic aus')}
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={toggleMic}
-            title={micError || undefined}
-            className={`flex items-center gap-1.5 px-3 py-1 rounded-full backdrop-blur-sm text-xs transition-colors ${
-              micActive
-                ? 'bg-emerald-500/30 text-emerald-300 ring-1 ring-emerald-500/40'
-                : micError
-                  ? 'bg-red-500/20 text-red-400 ring-1 ring-red-500/30'
-                  : 'bg-black/50 text-gray-400 hover:bg-black/70'
-            }`}
-            aria-label={micActive ? 'Mikrofon stumm schalten' : 'Mikrofon aktivieren'}
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3zM19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8" />
-            </svg>
-            {micActive ? 'Mic an' : 'Mic aus'}
-          </button>
+          {sdkMicAvailable === false && speechText && (
+            <p className="text-[9px] text-gray-300/90 bg-black/60 px-2 py-0.5 rounded-full max-w-[200px] truncate italic">
+              {speechText}
+            </p>
+          )}
         </div>
       )}
 

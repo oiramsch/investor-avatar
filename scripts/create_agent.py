@@ -22,8 +22,10 @@ Env required:
 - AGENT_NAME       optional, default "VectorSpan Release Party"
 - ALLOWED_DOMAIN   optional, default "party.vectorspan.io" (CSV for multiple)
 - PRESENTER_ID     optional, default "noelle-c2nQB6Cy11"  (D-ID stock presenter)
-- DRIVER_ID        optional, default "uM00QMwJ9x"
+- DRIVER_ID        optional, default "uM00QMwJ9x"  (only for "talk"/"clip" presenter types)
 - VOICE_ID         optional, default "en-US-JennyMultilingualNeural" (multilang Azure)
+- PRESENTER_TYPE   optional, default "expressive"  — "expressive" (LiveKit, mic-publish enabled),
+                   "clip", or "talk". Expressive is required for publishMicrophoneStream.
 
 Run:
     python scripts/create_agent.py
@@ -116,6 +118,7 @@ def main() -> int:
     presenter_id = os.getenv("PRESENTER_ID", "noelle-c2nQB6Cy11").strip()
     driver_id = os.getenv("DRIVER_ID", "uM00QMwJ9x").strip()
     voice_id = os.getenv("VOICE_ID", "en-US-JennyMultilingualNeural").strip()
+    presenter_type = os.getenv("PRESENTER_TYPE", "expressive").strip()
     allowed_domains = [
         d.strip() for d in os.getenv("ALLOWED_DOMAIN", "party.vectorspan.io").split(",") if d.strip()
     ]
@@ -123,15 +126,15 @@ def main() -> int:
 
     headers = did_auth_header(api_key)
 
-    presenter = {
-        "type": "talk",
-        "presenter_id": presenter_id,
-        "driver_id": driver_id,
-        "voice": {
-            "type": "microsoft",
-            "voice_id": voice_id,
-        },
-    }
+    voice = {"type": "microsoft", "voice_id": voice_id}
+    if presenter_type == "expressive":
+        # Expressive presenter uses LiveKit (v2) streaming → publishMicrophoneStream available
+        presenter = {"type": "expressive", "presenter_id": presenter_id, "voice": voice}
+    elif presenter_type == "clip":
+        presenter = {"type": "clip", "presenter_id": presenter_id, "driver_id": driver_id, "voice": voice}
+    else:
+        # "talk" (default legacy fallback) — WebRTC v1, no mic publish
+        presenter = {"type": "talk", "presenter_id": presenter_id, "driver_id": driver_id, "voice": voice}
 
     instructions = (
         "Du bist ARIA, der digitale Gastgeber der VectorSpan App Release Party. "
